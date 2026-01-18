@@ -139,9 +139,19 @@ class OLSReader:
         version: OLS format version (set during parsing)
     """
 
-    # Known parameter prefixes in Simos/Continental ECUs
-    PARAM_PREFIXES = ('c_', 'kf_', 'kl_', 'ip_', 'lc_', 'id_', 'trq_', 'ign_',
-                      'lam_', 'map_', 'tab_', 'ub_', 'ob_', 'maf_', 'fac_', 'n_', 't_')
+    # Known parameter prefixes in Simos/Continental ECUs and DSG transmissions
+    PARAM_PREFIXES = (
+        # Simos ECU prefixes
+        'c_', 'kf_', 'kl_', 'ip_', 'lc_', 'id_', 'trq_', 'ign_',
+        'lam_', 'map_', 'tab_', 'ub_', 'ob_', 'maf_', 'fac_', 'n_', 't_',
+        # DSG/TCU prefixes (DQ200, DQ250, DQ381, DQ500, etc.)
+        'ges_', 'kad_', 'dam_', 'umw_', 'kan_', 'mmr_', 'tip_', 'kkr_',
+        'ksf_', 'krszg', 'pag_', 'kremsr', 'kkracc', 'kku_', 'kus_',
+        'gesbrs', 'acc_', 'sbe_', 'socmp', 'sic_', 'hillholder', 'rbb_',
+        'a_', 'kusndaempf', 'kusacc', 'kremsri', 'hshv_', 'kusnslt',
+        'asr_', 'dyn_', 'gesgra', 'kremsrab', 'esu_', 'gseinleg',
+        'khszgang', 'kscmode', 'ab', 'nach_', 'tq_', 'sv_', 'sl_',
+    )
 
     # Format version thresholds
     # < 300: Old format (dims at +62/+66, flag at +106)
@@ -403,25 +413,69 @@ class OLSReader:
         """
         Extract parameter definitions from OLS file.
 
-        Parameter record structure (from name position):
-        - Description string precedes name (length-prefixed, search backwards)
-        - 24 bytes of metadata before name length field
-        - Name string (length-prefixed)
-        - Post-name structure:
-          - +0:  18 bytes of zeros/flags
-          - +18: Display max as 0xFF patterns
-          - +60: Padding
-          - +62: Columns (u16)
-          - +66: Rows (u16)
-          - +86: Unit string (if present)
-          - +104-108: Flag bytes
-          - +108/+110: Data offset (position varies by type)
-          - +112/+114: X-axis offset
+        For v250 format: Scan for '0b 00 [addr]' pattern and find parameter names backwards.
+        For newer formats: Scan for parameter names by prefix.
+        """
+        if self.version < self.NEW_FORMAT_VERSION:
+            return self._extract_parameters_v250()
+        else:
+            return self._extract_parameters_by_prefix()
+
+    def _extract_parameters_v250(self) -> list[Parameter]:
+        """
+        Extract parameters from v250 format by scanning for '0b 00 [addr]' marker.
+
+        The marker pattern appears after each parameter's post-name structure.
+        We scan for this pattern and work backwards to find the parameter name.
         """
         parameters = []
         found_names = set()
 
-        # Scan for parameter names
+        pos = 0
+        while pos < len(self.data) - 4:
+            # Look for '0b 00' marker followed by valid address
+            if self.data[pos] == 0x0b and self.data[pos + 1] == 0x00:
+                addr = self._read_u16(pos + 2)
+
+                # Validate address is in reasonable CAL range
+                if 0x0100 <= addr <= 0xFFFF:
+                    # Search backwards for parameter name (typically 110-140 bytes before marker)
+                    name_found = False
+                    for back in range(110, 200):
+                        check = pos - back
+                        if check < 4:
+                            break
+
+                        str_len = self._read_u32(check)
+                        if 3 < str_len < 80:
+                            try:
+                                name = self.data[check + 4:check + 4 + str_len].decode('ascii')
+
+                                # Validate as parameter name (alphanumeric with underscores)
+                                if (name.replace('_', '').replace('[', '').replace(']', '').isalnum() and
+                                    '_' in name and  # Must contain underscore
+                                    name not in found_names):
+
+                                    found_names.add(name)
+                                    param = self._parse_parameter_record(check, str_len, name)
+                                    if param:
+                                        parameters.append(param)
+                                    name_found = True
+                                    break
+                            except (UnicodeDecodeError, ValueError):
+                                pass
+
+            pos += 1
+
+        return parameters
+
+    def _extract_parameters_by_prefix(self) -> list[Parameter]:
+        """
+        Extract parameters by scanning for names with known prefixes (v300+ format).
+        """
+        parameters = []
+        found_names = set()
+
         pos = 0
         while pos < len(self.data) - 100:
             str_len = self._read_u32(pos)
@@ -542,39 +596,55 @@ class OLSReader:
         y_axis = None
 
         if self.version < self.NEW_FORMAT_VERSION:
-            # Old format (< 300): search for 0x8000 flag, then 16-bit offsets
-            flag_pos = None
-            for check in range(104, 120, 2):
-                if name_end + check + 2 <= len(self.data):
-                    val = self._read_u16(name_end + check)
-                    if val == 0x8000:
-                        flag_pos = check
-                        break
+            # Old format (< 300, e.g., v250): search for '0b 00 [addr]' marker pattern
+            # This pattern appears consistently for both VALUE and CURVE/MAP types
+            # The marker is at variable offset (typically 115-140) after parameter name
 
-            if flag_pos is None:
-                flag_pos = 106
+            # Search for 0x0b 0x00 marker followed by valid address
+            marker_pos = None
+            for check in range(110, 150):
+                if name_end + check + 4 <= len(self.data):
+                    if self.data[name_end + check] == 0x0b and self.data[name_end + check + 1] == 0x00:
+                        addr = self._read_u16(name_end + check + 2)
+                        # Validate address is in reasonable CAL range
+                        if 0x0100 <= addr <= 0xFFFF:
+                            marker_pos = check
+                            data_offset = addr
+                            break
 
-            ofs_pos = flag_pos + 2
-            if name_end + ofs_pos + 6 <= len(self.data):
-                if param_type == "MAP":
-                    # MAP: 24-bit offsets
-                    data_lo = self._read_u16(name_end + ofs_pos)
-                    data_hi = self.data[name_end + ofs_pos + 2]
-                    data_offset = data_lo | (data_hi << 16)
+            # If no marker found, try the legacy 0x80 pattern for CURVE/MAP types
+            if marker_pos is None and param_type in ("CURVE", "MAP"):
+                for check in range(100, 130):
+                    if name_end + check + 7 <= len(self.data):
+                        if self.data[name_end + check] == 0x80:
+                            addr1 = self._read_u16(name_end + check + 1)
+                            padding = self._read_u16(name_end + check + 3)
+                            addr2 = self._read_u16(name_end + check + 5)
+                            # Pattern: 0x80 [addr] 00 00 [addr+delta]
+                            if padding == 0 and 0x0100 <= addr1 <= 0xFFFF:
+                                delta = addr2 - addr1 if addr2 >= addr1 else 0
+                                # For CURVE/MAP, delta should match cols or rows
+                                if 0 <= delta <= 1000:
+                                    data_offset = addr1
+                                    break
 
-                    xaxis_lo = self._read_u16(name_end + ofs_pos + 4)
-                    xaxis_hi = self.data[name_end + ofs_pos + 6]
-                    xaxis_offset = xaxis_lo | (xaxis_hi << 16)
-
-                    x_axis = AxisInfo(points=cols, offset=xaxis_offset)
-                    y_axis = AxisInfo(points=rows, offset=xaxis_offset + cols)
-                else:
-                    # VALUE/CURVE: 16-bit offsets
-                    data_offset = self._read_u16(name_end + ofs_pos)
-                    if param_type == "CURVE":
-                        axis_offset = self._read_u16(name_end + ofs_pos + 4)
-                        points = cols if cols > 1 else rows
-                        x_axis = AxisInfo(points=points, offset=axis_offset)
+            # Extract axis info for CURVE/MAP if we have a valid data offset
+            if data_offset > 0 and param_type in ("CURVE", "MAP"):
+                # Search for 0x80 pattern which contains axis offset info
+                for check in range(100, 130):
+                    if name_end + check + 7 <= len(self.data):
+                        if self.data[name_end + check] == 0x80:
+                            addr1 = self._read_u16(name_end + check + 1)
+                            addr2 = self._read_u16(name_end + check + 5)
+                            if addr1 == data_offset and addr2 > addr1:
+                                # addr2 is start of axis data (or end of parameter data)
+                                # For CURVE: axis at addr2, with cols points
+                                # For MAP: x-axis at addr2, y-axis follows
+                                points = cols if cols > 1 else rows
+                                x_axis = AxisInfo(points=points, offset=addr2)
+                                if param_type == "MAP" and rows > 1:
+                                    y_axis = AxisInfo(points=rows, offset=addr2 + cols)
+                                break
 
         elif self.version < self.NEWER_FORMAT_VERSION:
             # Intermediate format (300-399): 0x80 flag at +163, 24-bit offsets at +164

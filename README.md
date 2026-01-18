@@ -9,6 +9,7 @@ A Python library for reading WinOLS `.ols` project files, extracting parameter d
 - Extract binary version entries (Original, edit history)
 - Extract embedded CAL (calibration) blocks
 - Support for multi-version files with edit history (v597+)
+- **v250 format support**: Marker-based address extraction for DSG/TCU files
 
 ## Installation
 
@@ -219,13 +220,35 @@ The structure varies between OLS format versions. The OLS version is stored at o
 
 #### OLS Version Ranges
 
-| Version | Format | Examples |
-|---------|--------|----------|
-| < 300 | Old format | v250, v285 |
-| 300-399 | Intermediate | v303, v357, v397 |
-| >= 400 | New format | v440, v478, v479 |
+| Version | Format | ECU Types | Notes |
+|---------|--------|-----------|-------|
+| 250 | Old format (marker-based) | DSG/TCU (DQ200, DQ250, DQ381) | Uses `0b 00` marker for addresses |
+| 285-299 | Old format (flag-based) | Simos 10.x, 12.x | Uses `0x80` flag for addresses |
+| 300-399 | Intermediate | Various | 24-bit offsets at fixed positions |
+| >= 400 | New format | Simos 18.x, 19.x, 22.x | 24-bit offsets, extended metadata |
 
 #### Old Format (version < 300)
+
+##### v250 Format (DSG/TCU files)
+
+The v250 format uses a marker-based approach for address extraction. The `0b 00 [addr]` pattern appears consistently after each parameter's post-name structure:
+
+| Offset | Size | Type | Description |
+|--------|------|------|-------------|
+| +62 | 2 | u16 | **Columns** |
+| +66 | 2 | u16 | **Rows** |
+| +100-105 | var | - | Float data (factor, etc.) |
+| +105 | 1 | u8 | Flag byte (0x80 for CURVE/MAP) |
+| +106-107 | 2 | u16 | Primary address (if 0x80 flag present) |
+| **+118-119** | 2 | u16 | **`0b 00` marker** |
+| **+120-121** | 2 | u16 | **Data offset** (reliable for all types) |
+
+The primary extraction method for v250:
+1. Scan for `0b 00` marker followed by valid address (0x0100-0xFFFF)
+2. Search backwards 110-200 bytes to find the parameter name
+3. For CURVE/MAP, also check for `0x80 [addr] 00 00 [addr+delta]` pattern for axis info
+
+##### v285+ Format (Simos ECU files)
 
 | Offset | Size | Type | Description |
 |--------|------|------|-------------|
