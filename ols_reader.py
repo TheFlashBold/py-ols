@@ -190,7 +190,8 @@ class OLSReader:
         length = self._read_u32(offset)
         if length == 0 or length > 500:
             return "", 4
-        s = self.data[offset + 4:offset + 4 + length].decode('utf-8', errors='replace')
+        # OLS files use Windows-1252 encoding (Western European), not UTF-8
+        s = self.data[offset + 4:offset + 4 + length].decode('cp1252', errors='replace')
         s = s.rstrip('\x00').strip()
         return s, 4 + length
 
@@ -282,7 +283,7 @@ class OLSReader:
                     pos + 28 + name_len <= len(self.data)):
 
                     try:
-                        name = self.data[pos + 28:pos + 28 + name_len].decode('utf-8')
+                        name = self.data[pos + 28:pos + 28 + name_len].decode('cp1252')
                         if name.isprintable() and name.strip():
                             name_clean = name.strip()
                             if name_clean in VALID_VERSION_NAMES:
@@ -309,7 +310,7 @@ class OLSReader:
                                     desc_len = self._read_u32(desc_pos)
                                     if 0 < desc_len < 500 and desc_pos + 4 + desc_len <= len(self.data):
                                         desc_bytes = self.data[desc_pos + 4:desc_pos + 4 + desc_len]
-                                        desc = desc_bytes.decode('utf-8', errors='replace').strip()
+                                        desc = desc_bytes.decode('cp1252', errors='replace').strip()
 
                                 versions.append(BinaryVersion(
                                     name=name_clean,
@@ -333,7 +334,7 @@ class OLSReader:
                 name_len = self._read_u32(pos + 4)
                 if 0 < name_len < 50:
                     try:
-                        name = self.data[pos + 8:pos + 8 + name_len].decode('utf-8')
+                        name = self.data[pos + 8:pos + 8 + name_len].decode('cp1252')
                         if name.isprintable() and name.strip():
                             name_clean = name.strip()
                             # Check if it's a known root folder name
@@ -355,7 +356,7 @@ class OLSReader:
                 name_len = self._read_u32(pos + 4)
                 if 0 < name_len < 50 and pos + 8 + name_len <= len(self.data):
                     try:
-                        name = self.data[pos + 8:pos + 8 + name_len].decode('utf-8')
+                        name = self.data[pos + 8:pos + 8 + name_len].decode('cp1252')
                         if name.isprintable() and name.strip():
                             name_clean = name.strip()
 
@@ -370,7 +371,7 @@ class OLSReader:
                                     desc_len = self._read_u32(desc_pos)
                                     if 0 < desc_len < 500 and desc_pos + 4 + desc_len <= len(self.data):
                                         desc_bytes = self.data[desc_pos + 4:desc_pos + 4 + desc_len]
-                                        desc = desc_bytes.decode('utf-8', errors='replace').strip()
+                                        desc = desc_bytes.decode('cp1252', errors='replace').strip()
 
                                 # Get blob_offset and blob_size (look back before parent_id)
                                 # Structure: [blob_index] [blob_offset] [blob_size] [timestamp] [parent_id]
@@ -723,7 +724,7 @@ class OLSReader:
                 str_len = self._read_u32(check_pos)
                 if 10 < str_len < 500 and check_pos + 4 + str_len <= desc_end:
                     desc = self.data[check_pos + 4:check_pos + 4 + str_len]
-                    desc = desc.decode('utf-8', errors='replace').strip()
+                    desc = desc.decode('cp1252', errors='replace').strip()
                     if desc and all(c.isprintable() or c == ' ' for c in desc):
                         return desc
             except (struct.error, ValueError):
