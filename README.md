@@ -1,10 +1,11 @@
 # py-ols - WinOLS File Reader
 
-A Python library for reading WinOLS `.ols` project files, extracting parameter definitions, CAL offsets, and embedded binary data.
+A Python library for reading WinOLS `.ols` project files and `.kp` (Kennfeld Pack) map pack files, extracting parameter definitions, CAL offsets, and embedded binary data.
 
 ## Features
 
 - Parse OLS files from version 250 to 597+
+- **KP (Kennfeld Pack) file support**: Parse map pack files with ZIP-compressed parameters
 - Extract parameter definitions with offsets, types, units, and factors
 - Extract binary version entries (Original, edit history)
 - Extract embedded CAL (calibration) blocks
@@ -60,16 +61,63 @@ if ols.cal_block:
         f.write(ols.cal_block.data)
 ```
 
+## KP (Kennfeld Pack) File Support
+
+KP files are map pack files used for sharing map definitions. They use ZIP compression and contain direct file offsets to binary data.
+
+```python
+from ols_reader import read_ols
+
+# KP files are automatically detected
+ols = read_ols("mappack.kp")
+
+print(f"Is KP file: {ols.is_kp_file}")        # True
+print(f"Big-endian data: {ols.big_endian_data}")  # True (common for DSG)
+
+# Addresses are direct file offsets into the corresponding .bin file
+for param in ols.parameters:
+    print(f"{param.name}: @0x{param.data_offset:x}")
+```
+
+### KP File Characteristics
+
+- **Version**: 597 (same as multi-version OLS)
+- **Storage**: ZIP-compressed "intern" file containing parameter definitions
+- **Addresses**: Direct file offsets (no transformation needed)
+- **Data format**: Big-endian (Motorola byte order) for DSG/TCU ECUs
+- **No embedded binary**: References external `.bin` files
+
+### Reading KP Data
+
+When reading binary data for KP parameters, use big-endian byte order:
+
+```python
+import struct
+from pathlib import Path
+
+ols = read_ols("dq250.kp")
+bin_data = Path("dq250.bin").read_bytes()
+
+for param in ols.parameters[:5]:
+    addr = param.data_offset
+    # KP files indicate big-endian data format
+    vals = [struct.unpack_from('>H', bin_data, addr + i*2)[0] for i in range(4)]
+    print(f"{param.name}: {vals}")
+```
+
 ## CLI Usage
 
 ```bash
 python ols_reader.py file.ols
+# or
+python ols_reader.py file.kp
 ```
 
-Example output:
+Example output for OLS file:
 ```
 File: DESKTOP-9T8M570_10009.ols
 OLS Version: 597
+Type: OLS (Project file)
 Vehicle: Audi A3 1.8TFSI (2014)
 Parameters: 22831
 
@@ -81,6 +129,21 @@ CAL: SC1CF00 (2051.0 KB)
 Sample parameters:
   CURVE UWORD ip_crlc_vp_bpa_ad_dif: @0x41262 *1.53e-05 [xaxis@0x4126e] folder=3
   VALUE UWORD c_crlc_bpa_ad: @0x41357 *0.00390625 folder=3
+```
+
+Example output for KP file:
+```
+File: dq250_mappack.kp
+OLS Version: 597
+Type: KP (Kennfeld Pack / Map Pack)
+Data format: Big-endian
+Vehicle:    ()
+Parameters: 603
+  By type: CURVE: 71, MAP: 37, VALUE: 495
+
+Sample parameters:
+  CURVE UWORD HdrPHauptMax_kl: @0x69416 [xaxis@0x6941e]
+  MAP   UWORD Ges_NAnHS12Eco_kf: @0x698e4 [xaxis@0x69944]
 ```
 
 ---
@@ -553,6 +616,76 @@ Cols: 8, Rows: 6
 Data offset (24-bit): 0x1C808 at +110/+112
 X-axis offset (24-bit): 0x1C838 at +114/+116
 ```
+
+## KP (Kennfeld Pack) File Format
+
+KP files are a variant of OLS files designed for sharing map definitions. They share the same header as OLS files but store parameter data differently.
+
+### File Structure
+
+```
+[OLS Header]                <- Same as standard OLS (magic, signature, version)
+[Minimal metadata]          <- Limited vehicle info
+[ZIP archive]               <- Starting around offset 0x400-0x500
+  └── intern                <- Compressed parameter definitions
+```
+
+### Detection
+
+A file is identified as KP if:
+1. OLS version >= 597
+2. ZIP signature (`PK\x03\x04`) found after header
+3. ZIP contains "intern" file
+
+### Intern File Structure
+
+The decompressed "intern" file contains parameter records:
+
+```
+[Parameter Record 1]
+  [6 x u32 metadata]        <- Type code, dimensions, etc.
+  [u32 name_length]
+  [name string]
+  [~0xa0 bytes post-name]   <- Contains addresses
+  [u32 data_offset]         <- Direct file offset (at ~0x9c-0xb0 from name end)
+  [u32 axis_offset]         <- Optional, for CURVE/MAP
+
+[Parameter Record 2]
+  ...
+```
+
+### Address Format
+
+| Offset from name_end | Size | Description |
+|---------------------|------|-------------|
+| +0x9c to +0xb0 | 4 | Data offset (scan for valid address) |
+| +0xa0 to +0xb4 | 4 | Axis offset (4 bytes after data offset) |
+
+Addresses are:
+- **Direct file offsets** into the corresponding `.bin` file
+- Typically in range 0x60000-0x80000 for DSG/TCU ECUs
+- No transformation needed (unlike some OLS formats)
+
+### Data Byte Order
+
+KP files for DSG/TCU ECUs use **big-endian** (Motorola) byte order, unlike Simos ECUs which use little-endian:
+
+```python
+# For KP files (DSG/TCU):
+value = struct.unpack_from('>H', bin_data, offset)[0]  # Big-endian
+
+# For OLS files (Simos):
+value = struct.unpack_from('<H', bin_data, offset)[0]  # Little-endian
+```
+
+### Parameter Types in KP
+
+Type codes in metadata[0]:
+- **2**: VALUE (scalar)
+- **3**: CURVE (1D table)
+- **4+**: MAP (2D table)
+
+Dimensions from metadata[4] and metadata[5] for MAPs.
 
 ## References
 

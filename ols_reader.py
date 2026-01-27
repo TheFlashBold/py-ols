@@ -1,27 +1,38 @@
 """
-OLS File Reader - Parse WinOLS .ols project files
+OLS File Reader - Parse WinOLS .ols and .kp (Kennfeld Pack) files
 
-This module provides a clean interface for reading WinOLS .ols files,
-extracting parameter definitions, addresses, and embedded binary data.
+This module provides a clean interface for reading WinOLS .ols files and
+.kp (map pack) files, extracting parameter definitions, addresses, and
+embedded binary data.
 
 OLS files are proprietary project files used by WinOLS ECU tuning software.
 They contain vehicle metadata, parameter definitions with addresses, and
 optionally embedded binary data.
+
+KP files (Kennfeld Pack / Map Pack) are a variant used for sharing map
+definitions. They use ZIP compression for parameter storage and contain
+direct file offsets rather than embedded binary data.
 
 Supported OLS Versions:
     - v250-285: Old format (limited binary version support)
     - v300-399: Intermediate format (parent ID based versions)
     - v400-596: Standard format (parent ID based versions)
     - v597+:    Multi-version format (edit history with version slots)
+    - v597+ KP: Map pack format with ZIP-compressed parameters
 
 Usage:
     from ols_reader import read_ols, OLSReader
 
-    # Quick read
+    # Quick read (works for both .ols and .kp files)
     ols = read_ols("file.ols")
     print(f"Parameters: {len(ols.parameters)}")
 
-    # With binary extraction
+    # KP files contain direct file offsets
+    ols = read_ols("mappack.kp")
+    for param in ols.parameters:
+        print(f"{param.name}: @0x{param.data_offset:x}")
+
+    # With binary extraction (OLS files only)
     reader = OLSReader("file.ols")
     ols = reader.parse()
     for version in ols.binary_versions:
@@ -32,8 +43,10 @@ Usage:
 
 from __future__ import annotations
 
+import io
 import re
 import struct
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -110,6 +123,8 @@ class OLSFile:
     parameters: list[Parameter] = field(default_factory=list)
     binary_versions: list[BinaryVersion] = field(default_factory=list)
     cal_block: Optional[CALBlock] = None
+    is_kp_file: bool = False  # True if this is a KP (Kennfeld Pack) file
+    big_endian_data: bool = False  # True if binary data should be read as big-endian (common for KP/DSG)
 
 
 class OLSReader:
@@ -166,6 +181,14 @@ class OLSReader:
         self._parse_header(ols)
         ols.version = self.version
 
+        # Check if this is a KP (Kennfeld Pack) file with ZIP-compressed parameters
+        if self._is_kp_file():
+            ols.is_kp_file = True
+            ols.big_endian_data = True  # KP files typically have big-endian data
+            ols.parameters = self._extract_kp_parameters()
+            # KP files don't have embedded binary versions or CAL blocks
+            return ols
+
         # Extract binary versions (Daten, Original, NOCS, etc.)
         ols.binary_versions = self._extract_binary_versions()
 
@@ -176,6 +199,206 @@ class OLSReader:
         ols.cal_block = self._extract_cal_block()
 
         return ols
+
+    def _is_kp_file(self) -> bool:
+        """
+        Check if this is a KP (Kennfeld Pack) file.
+
+        KP files are v597+ OLS files that contain ZIP-compressed parameter data
+        instead of raw parameter records. They're identified by:
+        - Version >= 597
+        - ZIP signature (PK\\x03\\x04) present after header
+        - Contains "intern" file in the ZIP archive
+        """
+        if self.version < 597:
+            return False
+
+        # Look for ZIP signature after header (typically around 0x400-0x500)
+        zip_sig = b'PK\x03\x04'
+        zip_pos = self.data.find(zip_sig, 0x100, 0x1000)
+
+        if zip_pos < 0:
+            return False
+
+        # Verify it's a valid ZIP with "intern" file
+        try:
+            zip_data = self.data[zip_pos:]
+            with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+                return 'intern' in zf.namelist()
+        except (zipfile.BadZipFile, Exception):
+            return False
+
+    def _extract_kp_parameters(self) -> list[Parameter]:
+        """
+        Extract parameters from KP (Kennfeld Pack) file.
+
+        KP files store parameters in a ZIP-compressed "intern" file with structure:
+        - Metadata (6 x u32): type_code, and dimension info
+        - Name length (u32) + name string
+        - Post-name data (~0x9c-0xb0 bytes) containing address
+
+        Addresses in KP files are direct file offsets into the corresponding .bin file.
+        """
+        parameters = []
+        found_names: set[str] = set()
+
+        # Find and extract intern file
+        zip_sig = b'PK\x03\x04'
+        zip_pos = self.data.find(zip_sig, 0x100, 0x1000)
+
+        if zip_pos < 0:
+            return parameters
+
+        try:
+            zip_data = self.data[zip_pos:]
+            with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+                intern_data = zf.read('intern')
+        except (zipfile.BadZipFile, KeyError, Exception):
+            return parameters
+
+        # Parse parameters from intern file
+        pos = 0
+        while pos < len(intern_data) - 300:
+            try:
+                # Read potential metadata (6 x u32)
+                meta = struct.unpack_from('<6I', intern_data, pos)
+                type_code = meta[0]
+
+                # Validate metadata pattern
+                if type_code in (2, 3) or 4 <= type_code <= 20:
+                    if all(m < 1000 for m in meta[1:5]):
+                        # Check for name length at pos + 24
+                        name_len = struct.unpack_from('<I', intern_data, pos + 24)[0]
+
+                        if 3 < name_len < 60 and pos + 28 + name_len < len(intern_data):
+                            try:
+                                name = intern_data[pos + 28:pos + 28 + name_len].decode('ascii').rstrip('\x00')
+
+                                # Validate name
+                                clean_name = name.replace('_', '').replace('[', '').replace(']', '').replace('.', '')
+                                if (name.isprintable() and
+                                    clean_name.isalnum() and
+                                    len(name) >= 3 and
+                                    ('_' in name or '.' in name) and
+                                    name not in found_names):
+
+                                    found_names.add(name)
+                                    param = self._parse_kp_parameter_record(
+                                        intern_data, pos, name_len, name, meta
+                                    )
+                                    if param:
+                                        parameters.append(param)
+
+                                    # Skip to next record
+                                    pos = pos + 28 + name_len + 0x100
+                                    continue
+                            except (UnicodeDecodeError, ValueError):
+                                pass
+            except struct.error:
+                pass
+
+            pos += 4
+
+        return parameters
+
+    def _parse_kp_parameter_record(
+        self,
+        intern_data: bytes,
+        meta_pos: int,
+        name_len: int,
+        name: str,
+        meta: tuple[int, ...]
+    ) -> Optional[Parameter]:
+        """
+        Parse a single parameter record from KP intern file.
+
+        Structure:
+        - Metadata at meta_pos (6 x u32)
+        - Name at meta_pos + 28
+        - Post-name data: ~0xa0 bytes containing address and axis info
+        - Address is at variable offset 0x9c-0xb0 from name end
+        """
+        name_end = meta_pos + 28 + name_len
+
+        if name_end + 0xb0 > len(intern_data):
+            return None
+
+        # Determine type from metadata
+        type_code = meta[0]
+        if type_code == 2:
+            param_type = "VALUE"
+        elif type_code == 3:
+            param_type = "CURVE"
+        else:
+            param_type = "MAP"
+
+        # Extract dimensions from metadata (meta[4] often contains points/cols info)
+        cols = 1
+        rows = 1
+        if param_type == "CURVE":
+            cols = meta[4] if 1 < meta[4] < 100 else 1
+        elif param_type == "MAP":
+            cols = meta[4] if 1 < meta[4] < 100 else 1
+            rows = meta[5] if 1 < meta[5] < 100 else 1
+
+        # Find address - scan range 0x9c-0xb0 from name_end
+        # KP addresses are direct file offsets stored as little-endian
+        # Typically in 0x60000-0x80000 range for DSG
+        data_offset = 0
+        for off in range(0x9c, 0xb0):
+            addr_pos = name_end + off
+            if addr_pos + 4 <= len(intern_data):
+                candidate = struct.unpack_from('<I', intern_data, addr_pos)[0]
+                # Valid address range depends on ECU type
+                # DSG: 0x60000-0x80000, but allow wider range for other ECUs
+                if 0x1000 <= candidate < 0x800000:
+                    data_offset = candidate
+                    break
+
+        # Try to find axis offset (typically 4 bytes after data offset)
+        x_axis = None
+        y_axis = None
+        if data_offset > 0 and param_type in ("CURVE", "MAP"):
+            for off in range(0x9c, 0xb0):
+                addr_pos = name_end + off
+                if addr_pos + 8 <= len(intern_data):
+                    addr1 = struct.unpack_from('<I', intern_data, addr_pos)[0]
+                    addr2 = struct.unpack_from('<I', intern_data, addr_pos + 4)[0]
+                    if addr1 == data_offset and 0x1000 <= addr2 < 0x800000:
+                        x_axis = AxisInfo(points=cols, offset=addr2)
+                        if param_type == "MAP" and rows > 1:
+                            # Y-axis offset typically follows X-axis data
+                            y_axis = AxisInfo(points=rows, offset=addr2 + cols * 2)
+                        break
+
+        # Try to extract description (search backwards from metadata)
+        description = ""
+        if meta_pos > 50:
+            # Look for length-prefixed string before metadata
+            for back in range(4, min(200, meta_pos), 4):
+                check_pos = meta_pos - back
+                try:
+                    str_len = struct.unpack_from('<I', intern_data, check_pos)[0]
+                    if 5 < str_len < 200 and check_pos + 4 + str_len <= meta_pos:
+                        desc_bytes = intern_data[check_pos + 4:check_pos + 4 + str_len]
+                        desc = desc_bytes.decode('cp1252', errors='replace').rstrip('\x00').strip()
+                        if desc and len(desc) > 5 and all(c.isprintable() or c in ' \t' for c in desc):
+                            description = desc
+                            break
+                except (struct.error, UnicodeDecodeError):
+                    pass
+
+        return Parameter(
+            name=name,
+            description=description,
+            param_type=param_type,
+            data_type="UWORD",  # KP files typically use UWORD (big-endian in the bin file)
+            cols=cols,
+            rows=rows,
+            data_offset=data_offset,
+            x_axis=x_axis,
+            y_axis=y_axis,
+        )
 
     def _read_u16(self, offset: int) -> int:
         """Read unsigned 16-bit little-endian value"""
@@ -565,54 +788,36 @@ class OLSReader:
         y_axis = None
 
         if self.version < self.NEW_FORMAT_VERSION:
-            # Old format (< 300, e.g., v250): search for '0b 00 [addr]' marker pattern
-            # This pattern appears consistently for both VALUE and CURVE/MAP types
-            # The marker is at variable offset (typically 115-140) after parameter name
+            # Old format (< 300, e.g., v250): search for 0x80 marker pattern
+            # Pattern: 0x80 [addr:u16] [padding:u16] [addr2:u16]
+            # The marker position varies (typically 100-160) after parameter name
 
-            # Search for 0x0b 0x00 marker followed by valid address
-            marker_pos = None
-            for check in range(110, 150):
-                if name_end + check + 4 <= len(self.data):
-                    if self.data[name_end + check] == 0x0b and self.data[name_end + check + 1] == 0x00:
-                        addr = self._read_u16(name_end + check + 2)
-                        # Validate address is in reasonable CAL range
-                        if 0x0100 <= addr <= 0xFFFF:
-                            marker_pos = check
-                            data_offset = addr
-                            break
-
-            # If no marker found, try the legacy 0x80 pattern for CURVE/MAP types
-            if marker_pos is None and param_type in ("CURVE", "MAP"):
-                for check in range(100, 130):
-                    if name_end + check + 7 <= len(self.data):
-                        if self.data[name_end + check] == 0x80:
-                            addr1 = self._read_u16(name_end + check + 1)
-                            padding = self._read_u16(name_end + check + 3)
-                            addr2 = self._read_u16(name_end + check + 5)
-                            # Pattern: 0x80 [addr] 00 00 [addr+delta]
-                            if padding == 0 and 0x0100 <= addr1 <= 0xFFFF:
-                                delta = addr2 - addr1 if addr2 >= addr1 else 0
-                                # For CURVE/MAP, delta should match cols or rows
-                                if 0 <= delta <= 1000:
-                                    data_offset = addr1
-                                    break
-
-            # Extract axis info for CURVE/MAP if we have a valid data offset
-            if data_offset > 0 and param_type in ("CURVE", "MAP"):
-                # Search for 0x80 pattern which contains axis offset info
-                for check in range(100, 130):
-                    if name_end + check + 7 <= len(self.data):
-                        if self.data[name_end + check] == 0x80:
-                            addr1 = self._read_u16(name_end + check + 1)
-                            addr2 = self._read_u16(name_end + check + 5)
-                            if addr1 == data_offset and addr2 > addr1:
-                                # addr2 is start of axis data (or end of parameter data)
-                                # For CURVE: axis at addr2, with cols points
-                                # For MAP: x-axis at addr2, y-axis follows
+            # Search for 0x80 marker followed by valid address pattern
+            for check in range(100, 180):
+                if name_end + check + 7 <= len(self.data):
+                    if self.data[name_end + check] == 0x80:
+                        addr1 = self._read_u16(name_end + check + 1)
+                        padding = self._read_u16(name_end + check + 3)
+                        addr2 = self._read_u16(name_end + check + 5)
+                        # Pattern: 0x80 [addr] 00 00 [addr+delta]
+                        if padding == 0 and 0x0100 <= addr1 <= 0xFFFF:
+                            data_offset = addr1
+                            # For CURVE/MAP, addr2 is typically axis offset
+                            if param_type in ("CURVE", "MAP") and addr2 > addr1:
                                 points = cols if cols > 1 else rows
                                 x_axis = AxisInfo(points=points, offset=addr2)
                                 if param_type == "MAP" and rows > 1:
                                     y_axis = AxisInfo(points=rows, offset=addr2 + cols)
+                            break
+
+            # Fallback: search for '0b 00' marker pattern (some files use this)
+            if data_offset == 0:
+                for check in range(100, 160):
+                    if name_end + check + 4 <= len(self.data):
+                        if self.data[name_end + check] == 0x0b and self.data[name_end + check + 1] == 0x00:
+                            addr = self._read_u16(name_end + check + 2)
+                            if 0x0100 <= addr <= 0xFFFF:
+                                data_offset = addr
                                 break
 
         elif self.version < self.NEWER_FORMAT_VERSION:
@@ -827,15 +1032,28 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("Usage: python ols_reader.py <file.ols>")
+        print("Usage: python ols_reader.py <file.ols|file.kp>")
         sys.exit(1)
 
     ols = read_ols(sys.argv[1])
 
     print(f"File: {ols.filename}")
     print(f"OLS Version: {ols.version}")
+    if ols.is_kp_file:
+        print("Type: KP (Kennfeld Pack / Map Pack)")
+        print(f"Data format: {'Big-endian' if ols.big_endian_data else 'Little-endian'}")
+    else:
+        print("Type: OLS (Project file)")
     print(f"Vehicle: {ols.make} {ols.model} {ols.engine} ({ols.year})")
     print(f"Parameters: {len(ols.parameters)}")
+
+    # Count by type
+    type_counts: dict[str, int] = {}
+    for p in ols.parameters:
+        type_counts[p.param_type] = type_counts.get(p.param_type, 0) + 1
+    if type_counts:
+        type_str = ", ".join(f"{t}: {c}" for t, c in sorted(type_counts.items()))
+        print(f"  By type: {type_str}")
 
     if ols.binary_versions:
         print(f"\nBinary versions ({len(ols.binary_versions)}):")
