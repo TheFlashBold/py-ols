@@ -139,19 +139,11 @@ class OLSReader:
         version: OLS format version (set during parsing)
     """
 
-    # Known parameter prefixes in Simos/Continental ECUs and DSG transmissions
-    PARAM_PREFIXES = (
-        # Simos ECU prefixes
-        'c_', 'kf_', 'kl_', 'ip_', 'lc_', 'id_', 'trq_', 'ign_',
-        'lam_', 'map_', 'tab_', 'ub_', 'ob_', 'maf_', 'fac_', 'n_', 't_',
-        # DSG/TCU prefixes (DQ200, DQ250, DQ381, DQ500, etc.)
-        'ges_', 'kad_', 'dam_', 'umw_', 'kan_', 'mmr_', 'tip_', 'kkr_',
-        'ksf_', 'krszg', 'pag_', 'kremsr', 'kkracc', 'kku_', 'kus_',
-        'gesbrs', 'acc_', 'sbe_', 'socmp', 'sic_', 'hillholder', 'rbb_',
-        'a_', 'kusndaempf', 'kusacc', 'kremsri', 'hshv_', 'kusnslt',
-        'asr_', 'dyn_', 'gesgra', 'kremsrab', 'esu_', 'gseinleg',
-        'khszgang', 'kscmode', 'ab', 'nach_', 'tq_', 'sv_', 'sl_',
-    )
+    # Reference: Common parameter prefixes (not used for detection anymore)
+    # Detection now uses structural pattern matching which works for any naming convention
+    # Simos ECU: c_, kf_, kl_, ip_, lc_, id_, trq_, ign_, lam_, map_, tab_, etc.
+    # DSG/TCU: ges_, kad_, dam_, umw_, kan_, mmr_, tip_, kkr_, pag_, acc_, etc.
+    # DL501: Ahd_, Ges_, Gss_, Krm_, Umw_, Khs_, etc.
 
     # Format version thresholds
     # < 300: Old format (dims at +62/+66, flag at +106)
@@ -413,91 +405,67 @@ class OLSReader:
         """
         Extract parameter definitions from OLS file.
 
-        For v250 format: Scan for '0b 00 [addr]' pattern and find parameter names backwards.
-        For newer formats: Scan for parameter names by prefix.
-        """
-        if self.version < self.NEW_FORMAT_VERSION:
-            return self._extract_parameters_v250()
-        else:
-            return self._extract_parameters_by_prefix()
+        OLS stores parameters with structure:
+        - Description string (length-prefixed)
+        - Zero padding
+        - Metadata (6 x u32 values) where meta[0] = type code (2=VALUE, 3=CURVE, 4+=MAP)
+        - Name string (length-prefixed)
+        - Post-name metadata (conversion, display settings)
 
-    def _extract_parameters_v250(self) -> list[Parameter]:
-        """
-        Extract parameters from v250 format by scanning for '0b 00 [addr]' marker.
-
-        The marker pattern appears after each parameter's post-name structure.
-        We scan for this pattern and work backwards to find the parameter name.
+        This method finds parameters by their structural pattern, not by name prefixes,
+        which allows it to work with any ECU type (Simos, DSG, etc.) regardless of
+        naming conventions.
         """
         parameters = []
-        found_names = set()
+        found_names: set[str] = set()
 
-        pos = 0
-        while pos < len(self.data) - 4:
-            # Look for '0b 00' marker followed by valid address
-            if self.data[pos] == 0x0b and self.data[pos + 1] == 0x00:
-                addr = self._read_u16(pos + 2)
+        # Scan for metadata + name pattern
+        # Metadata is 6 x u32 (24 bytes) followed by name_len (u32) + name
+        pos = 0x100  # Skip file header
+        while pos < len(self.data) - 50:
+            try:
+                # Read potential metadata (6 x u32)
+                meta = struct.unpack_from('<6I', self.data, pos)
 
-                # Validate address is in reasonable CAL range
-                if 0x0100 <= addr <= 0xFFFF:
-                    # Search backwards for parameter name (typically 110-140 bytes before marker)
-                    name_found = False
-                    for back in range(110, 200):
-                        check = pos - back
-                        if check < 4:
-                            break
+                # Validate metadata pattern:
+                # meta[0] = type code (2=VALUE, 3=CURVE, 4+=MAP)
+                # meta[1-3] should be small values (often 1 for dimensions)
+                # meta[4] should be 0 or small (row/col related)
+                # meta[5] is often 0
+                type_code = meta[0]
+                if type_code in (2, 3) or 4 <= type_code <= 20:
+                    # Check that other values look reasonable
+                    if all(m < 1000 for m in meta[1:5]):
+                        # Check for name length at pos + 24
+                        name_pos = pos + 24
+                        if name_pos + 4 < len(self.data):
+                            name_len = self._read_u32(name_pos)
 
-                        str_len = self._read_u32(check)
-                        if 3 < str_len < 80:
-                            try:
-                                name = self.data[check + 4:check + 4 + str_len].decode('ascii')
+                            if 2 < name_len < 100 and name_pos + 4 + name_len < len(self.data):
+                                try:
+                                    name = self.data[name_pos + 4:name_pos + 4 + name_len].decode('ascii')
 
-                                # Validate as parameter name (alphanumeric with underscores)
-                                if (name.replace('_', '').replace('[', '').replace(']', '').isalnum() and
-                                    '_' in name and  # Must contain underscore
-                                    name not in found_names):
+                                    # Validate name: must be alphanumeric with underscores, brackets
+                                    # and contain at least one underscore or be all uppercase
+                                    clean_name = name.replace('_', '').replace('[', '').replace(']', '').replace('.', '')
+                                    if (name.isprintable() and
+                                        clean_name.isalnum() and
+                                        len(name) >= 3 and
+                                        ('_' in name or name.isupper() or '.' in name) and
+                                        name not in found_names and
+                                        not name.startswith('WinOLS') and
+                                        not name.endswith('.ols')):
 
-                                    found_names.add(name)
-                                    param = self._parse_parameter_record(check, str_len, name)
-                                    if param:
-                                        parameters.append(param)
-                                    name_found = True
-                                    break
-                            except (UnicodeDecodeError, ValueError):
-                                pass
-
-            pos += 1
-
-        return parameters
-
-    def _extract_parameters_by_prefix(self) -> list[Parameter]:
-        """
-        Extract parameters by scanning for names with known prefixes (v300+ format).
-        """
-        parameters = []
-        found_names = set()
-
-        pos = 0
-        while pos < len(self.data) - 100:
-            str_len = self._read_u32(pos)
-
-            if 3 < str_len < 80:
-                try:
-                    name = self.data[pos + 4:pos + 4 + str_len].decode('ascii')
-                    name_lower = name.lower()
-
-                    if (name.replace('_', '').replace('[', '').replace(']', '').isalnum() and
-                        any(name_lower.startswith(p) for p in self.PARAM_PREFIXES) and
-                        name not in found_names):
-
-                        found_names.add(name)
-                        param = self._parse_parameter_record(pos, str_len, name)
-                        if param:
-                            parameters.append(param)
-                        pos += 4 + str_len
-                        continue
-                except (UnicodeDecodeError, ValueError):
-                    pass
-
+                                        found_names.add(name)
+                                        param = self._parse_parameter_record(name_pos, name_len, name)
+                                        if param:
+                                            parameters.append(param)
+                                        pos = name_pos + 4 + name_len
+                                        continue
+                                except (UnicodeDecodeError, ValueError):
+                                    pass
+            except struct.error:
+                pass
             pos += 1
 
         return parameters
