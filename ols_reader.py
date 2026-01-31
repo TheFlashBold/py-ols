@@ -53,6 +53,14 @@ from typing import Optional
 
 
 @dataclass
+class FolderEntry:
+    """Folder/function entry from ols structure"""
+    idx: int  # Folder index (matches folder_id in parameters)
+    name: str  # Folder name (e.g., "ACQ_KNK_sensor_signal_gen")
+    description: str = ""  # Description (e.g., "Acquisition of knock sensor signal (gen)")
+
+
+@dataclass
 class AxisInfo:
     """Axis definition for CURVE/MAP parameters"""
     points: int
@@ -125,6 +133,7 @@ class OLSFile:
     cal_block: Optional[CALBlock] = None
     is_kp_file: bool = False  # True if this is a KP (Kennfeld Pack) file
     big_endian_data: bool = False  # True if binary data should be read as big-endian (common for KP/DSG)
+    folders: list[FolderEntry] = field(default_factory=list)  # Folder/Function entries
 
 
 class OLSReader:
@@ -197,6 +206,8 @@ class OLSReader:
 
         # Find and extract CAL block
         ols.cal_block = self._extract_cal_block()
+
+        ols.folders = self._extract_folder_entries()
 
         return ols
 
@@ -994,6 +1005,76 @@ class OLSReader:
             data=cal_data,
         )
 
+    def _extract_folder_entries(self) -> list[FolderEntry]:
+        """
+        Extract folder/function entries from OLS file.
+
+        These entries define the folder structure used to organize parameters.
+        The folder index (idx) matches the folder_id in Parameter objects.
+
+        Structure:
+        - [ffffffff] Marker (4 bytes)
+        - [00000000] Padding (4 bytes)
+        - [idx]      Folder index (4 bytes)
+        - [00000000] Padding (4 bytes)
+        - [strlen]   String length (4 bytes)
+        - [string]   Format: "NAME: \\"DESCRIPTION\\""
+
+        Example:
+        - __DDS_EXPA2_DEFAULT_FUNC__: "" (root folder)
+        - ACQ_KNK_sensor_signal_gen: "Calibration Hint: Acquisition of knock sensor signal (gen)"
+        """
+        entries: list[FolderEntry] = []
+        found_names: set[str] = set()
+
+        # Find folder section - search for the ffffffff marker pattern
+        # Start from 1/3 into file (folders are typically after CAL block)
+        search_start = len(self.data) // 3
+        marker = b'\xff\xff\xff\xff'
+
+        pos = search_start
+        while True:
+            # Find next ffffffff marker
+            pos = self.data.find(marker, pos)
+            if pos < 0 or pos + 20 > len(self.data):
+                break
+
+            # Check structure: [marker] [pad1=0] [idx] [pad2=0] [strlen]
+            pad1 = struct.unpack_from('<I', self.data, pos + 4)[0]
+            idx = struct.unpack_from('<I', self.data, pos + 8)[0]
+            pad2 = struct.unpack_from('<I', self.data, pos + 12)[0]
+            strlen = struct.unpack_from('<I', self.data, pos + 16)[0]
+
+            # Validate structure
+            if pad1 == 0 and pad2 == 0 and 5 < strlen < 300 and idx < 2000:
+                if pos + 20 + strlen <= len(self.data):
+                    try:
+                        s = self.data[pos + 20:pos + 20 + strlen].decode('cp1252', errors='replace')
+
+                        # Must have the NAME: "DESC" format
+                        if ': "' in s:
+                            name, desc = s.split(': "', 1)
+                            desc = desc.rstrip('"')
+
+                            # Validate name: alphanumeric with underscores
+                            clean_name = name.replace('_', '').replace('.', '')
+                            if clean_name.isalnum() and name not in found_names:
+                                found_names.add(name)
+                                entries.append(FolderEntry(
+                                    idx=idx,
+                                    name=name,
+                                    description=desc,
+                                ))
+                                # Skip past this entry
+                                pos = pos + 20 + strlen
+                                continue
+                    except (UnicodeDecodeError, ValueError):
+                        pass
+
+            pos += 1
+
+        return entries
+
     def extract_binary(self, version: BinaryVersion) -> bytes:
         """
         Extract binary blob data for a given binary version.
@@ -1072,13 +1153,27 @@ if __name__ == "__main__":
     if ols.cal_block:
         print(f"\nCAL: {ols.cal_block.epk} ({len(ols.cal_block.data) / 1024:.1f} KB)")
 
-    # Show sample parameters with offsets, data type, factor, and folder IDs
+    if ols.folders:
+        print(f"\nFolders ({len(ols.folders)}):")
+        # Create lookup for folder names
+        folder_lookup = {f.idx: f for f in ols.folders}
+        for f in ols.folders[:10]:
+            desc_str = f": \"{f.description[:40]}\"" if f.description else ""
+            print(f"  [{f.idx:4d}] {f.name}{desc_str}")
+        if len(ols.folders) > 10:
+            print(f"  ... and {len(ols.folders) - 10} more")
+
+    # Create folder lookup for parameter display
+    folder_lookup = {f.idx: f.name for f in ols.folders} if ols.folders else {}
+
+    # Show sample parameters with offsets, data type, factor, and folder names
     print("\nSample parameters:")
     for p in ols.parameters[:10]:
         axis_info = ""
         if p.x_axis:
             axis_info = f" [xaxis@{hex(p.x_axis.offset)}]"
-        folder_str = f" folder={p.folder_id}" if p.folder_id else ""
+        folder_name = folder_lookup.get(p.folder_id, "")
+        folder_str = f" [{folder_name}]" if folder_name else (f" [folder={p.folder_id}]" if p.folder_id else "")
         factor_str = f" *{p.factor}" if p.factor != 1.0 else ""
         unit_str = f" {p.unit}" if p.unit else ""
         print(f"  {p.param_type:5} {p.data_type:5} {p.name}: @{hex(p.data_offset)}{factor_str}{unit_str}{axis_info}{folder_str}")
