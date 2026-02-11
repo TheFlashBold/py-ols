@@ -64,9 +64,14 @@ class FolderEntry:
 class AxisInfo:
     """Axis definition for CURVE/MAP parameters"""
     points: int
-    offset: int  # CAL offset for axis data
+    address: int = 0  # CAL offset/address for axis data
+    offset: int = 0  # Conversion offset (physical = raw * factor + offset)
     unit: str = ""
-    factor: float = 1.0  # Conversion factor (physical = raw * factor)
+    factor: float = 1.0  # Conversion factor (physical = raw * factor + offset)
+    id: str = ""  # Axis ID (e.g., "n_32", "_CNV_A_R_LINEAR_____33_CM")
+    description: str = ""  # Axis description (e.g., "Engine speed -Resolution 32 rpm")
+    data_source: int = 0  # Data source type (1=values, 2=eeprom, etc.)
+    data_type: str = "UWORD"  # Data type (UBYTE, UWORD, etc.)
 
 
 @dataclass
@@ -74,7 +79,7 @@ class Parameter:
     """ECU parameter definition extracted from OLS file"""
     name: str
     description: str = ""
-    param_type: str = "VALUE"  # VALUE, CURVE, or MAP
+    param_type: str = "VALUE"  # VALUE, CURVE, MAP, or MAP_INVERSE
     data_type: str = "UWORD"  # UBYTE, SBYTE, UWORD, SWORD, ULONG, SLONG
     cols: int = 1
     rows: int = 1
@@ -82,8 +87,10 @@ class Parameter:
     x_axis: Optional[AxisInfo] = None
     y_axis: Optional[AxisInfo] = None
     unit: str = ""
-    factor: float = 1.0  # Conversion factor (physical = raw * factor)
+    factor: float = 1.0  # Conversion factor (physical = raw * factor + offset)
+    offset: float = 0.0  # Conversion offset
     folder_id: int = 0  # Folder/category ID (numeric ID only - folder names not found in OLS files)
+    type_code: int = 0  # Raw type code from metadata (2=VALUE, 3=CURVE, 4=MAP, 5=MAP_INVERSE)
 
 
 @dataclass
@@ -99,6 +106,10 @@ class BinaryVersion:
         - version_index is the slot index (0-based)
         - version_count is total edit history depth
         - blob_offset is calculated from: blob_base + version_index * blob_size
+
+    Verification:
+        - epk: Identification string found in binary (e.g., "SC1C910", "SC8F830")
+        - epk_offset: Offset relative to blob_offset where EPK was found
     """
     name: str
     description: str = ""  # Import path/creation description
@@ -108,6 +119,8 @@ class BinaryVersion:
     blob_size: int = 0  # Binary blob size in bytes
     version_index: int = 0  # Version index (0-based) for multi-version files (v597+)
     version_count: int = 0  # Total number of version slots (v597+)
+    epk: str = ""  # EPK/identification string found in binary
+    epk_offset: int = 0  # Offset relative to blob_offset where EPK was found
 
 
 @dataclass
@@ -634,7 +647,107 @@ class OLSReader:
 
             pos += 1
 
+        # Find EPK/verification info for each binary version
+        for v in versions:
+            if v.blob_offset > 0 and v.blob_size > 0:
+                epk, epk_offset = self._find_binary_verification(v.blob_offset, v.blob_size)
+                v.epk = epk
+                v.epk_offset = epk_offset
+
         return versions
+
+    def _find_binary_verification(self, blob_offset: int, blob_size: int) -> tuple[str, int]:
+        """
+        Search for EPK/identification string within a binary block.
+
+        First searches at known CAL offsets within the binary, then falls back
+        to searching the entire file for CAS/EPK patterns.
+
+        Returns:
+            (epk, offset) where offset is relative to blob_offset (or 0 if found outside)
+        """
+        # Known CAL offsets for different ECU types (from EPK prefix)
+        # Simos18.10 (Aurix TC29x): SCG -> 0x820000
+        # Simos18.1 (TC1793): SC8 -> 0x800000
+        # Simos12 (TC1797): SC1, SA3 -> 0x40000
+        # Simos16: SC4 -> 0x100000
+        # MED17: S82, S85 -> 0x40000
+        cal_offsets = [0x40000, 0x100000, 0x800000, 0x820000, 0x0]
+
+        # Method 1: Search at known CAL offsets within binary
+        for cal_off in cal_offsets:
+            if cal_off + 20 > blob_size:
+                continue
+
+            pos = blob_offset + cal_off
+            if pos + 20 > len(self.data):
+                continue
+
+            header = self.data[pos:pos + 20]
+            epk, rel_offset = self._extract_epk_from_header(header)
+            if epk:
+                return epk, cal_off + rel_offset
+
+        # Method 2: Search entire file for CAS pattern (for files where CAL is separate)
+        cas_pattern = rb'CAS[A-Z][A-Z0-9]{4}'
+        for match in re.finditer(cas_pattern, self.data):
+            cas_pos = match.start()
+            # EPK is 8 bytes after CAS
+            epk_pos = cas_pos + 8
+            if epk_pos + 7 <= len(self.data):
+                epk_bytes = self.data[epk_pos:epk_pos + 7]
+                epk = epk_bytes.split(b'\x00')[0].decode('ascii', errors='replace')
+                if epk and len(epk) >= 6 and epk[0] == 'S':
+                    # Calculate offset relative to binary start
+                    rel_offset = cas_pos - blob_offset + 8
+                    # Use known CAL offset based on EPK prefix
+                    known_offset = self._get_cal_offset_for_epk(epk)
+                    if known_offset > 0:
+                        return epk, known_offset + 8  # +8 for CAS header
+                    return epk, rel_offset if rel_offset >= 0 else 0
+
+        return "", 0
+
+    def _extract_epk_from_header(self, header: bytes) -> tuple[str, int]:
+        """Extract EPK from a 20-byte header area."""
+        # Look for CAS header, EPK follows at +8
+        cas_match = re.search(rb'CAS[A-Z][A-Z0-9]{4}', header)
+        if cas_match:
+            epk_pos = cas_match.start() + 8
+            if epk_pos + 7 <= len(header):
+                epk_bytes = header[epk_pos:epk_pos + 7]
+                epk = epk_bytes.split(b'\x00')[0].decode('ascii', errors='replace')
+                if epk and len(epk) >= 6:
+                    return epk, epk_pos
+
+        # Direct EPK search (for files without CAS header)
+        epk_match = re.search(rb'S[A-Z][0-9A-Z]{5}\x00', header)
+        if epk_match:
+            epk = epk_match.group()[:-1].decode('ascii')
+            return epk, epk_match.start()
+
+        return "", 0
+
+    def _get_cal_offset_for_epk(self, epk: str) -> int:
+        """Return CAL offset based on EPK prefix (for full bin files)."""
+        epk_upper = epk.upper()
+        # Simos18.10 (Aurix TC29x)
+        if epk_upper.startswith('SCG'):
+            return 0x820000
+        # Simos18.1 (TC1793)
+        if epk_upper.startswith('SC8'):
+            return 0x800000
+        # Simos12 (TC1797)
+        if epk_upper.startswith('SC1') or epk_upper.startswith('SA3'):
+            return 0x40000
+        # Simos16
+        if epk_upper.startswith('SC4'):
+            return 0x100000
+        # MED17
+        if epk_upper.startswith('S82') or epk_upper.startswith('S85'):
+            return 0x40000
+        # Default
+        return 0
 
     def _extract_parameters(self) -> list[Parameter]:
         """
@@ -705,6 +818,19 @@ class OLSReader:
 
         return parameters
 
+    def _read_axis_string(self, pos: int) -> tuple[str, int]:
+        """Read a length-prefixed string at position, return (string, end_position)"""
+        if pos + 4 > len(self.data):
+            return "", pos
+        strlen = self._read_u32(pos)
+        if strlen == 0 or strlen > 200:
+            return "", pos + 4
+        end = pos + 4 + strlen
+        if end > len(self.data):
+            return "", pos + 4
+        s = self.data[pos + 4:end].decode('cp1252', errors='replace').rstrip('\x00')
+        return s, end
+
     def _parse_parameter_record(self, name_pos: int, name_len: int, name: str) -> Optional[Parameter]:
         """
         Parse a single parameter record.
@@ -715,15 +841,21 @@ class OLSReader:
         - Dimensions at +62/+66 as u16
         - Flag 0x8000 around +106, followed by 16-bit offsets
 
-        Newer format (version >= 300):
+        Newer format (version >= 400):
         - Dimensions at +117 (cols) and +121 (rows) as single bytes
-        - Flag 0x80 at +160, followed by 24-bit offsets at +161-163
-        - Axis offset at +165-167
+        - Factor at +146 (8 bytes double)
+        - Marker 0x80 at +161, data offset at +162
+        - Y-axis block at +202: ID, data_source, unit, factor, offset, address
+        - X-axis block at +328: description, unit, factor, address, ID
         """
         name_end = name_pos + 4 + name_len
 
         if name_end + 180 > len(self.data):
             return Parameter(name=name)
+
+        # Get type_code from metadata
+        meta_start = name_pos - 24
+        type_code = self._read_u32(meta_start) if meta_start >= 0 else 0
 
         # Read dimensions - position and format varies by OLS version
         if self.version < self.NEW_FORMAT_VERSION:
@@ -745,23 +877,24 @@ class OLSReader:
         if rows > 100 or rows == 0:
             rows = 1
 
-        # Determine parameter type
-        if cols > 1 and rows > 1:
+        # Determine parameter type from type_code or dimensions
+        # type_code: 2=VALUE, 3=CURVE, 4=MAP, 5=MAP_INVERSE
+        if type_code == 5:
+            param_type = "MAP_INVERSE"
+        elif type_code == 4 or (cols > 1 and rows > 1):
             param_type = "MAP"
-        elif cols > 1 or rows > 1:
+        elif type_code == 3 or cols > 1 or rows > 1:
             param_type = "CURVE"
         else:
             param_type = "VALUE"
 
         # Read data type indicator and determine data_type string
         # Data type indicator: 0/1=UBYTE, 2=SBYTE, 3=UWORD, 4=SWORD, 5=ULONG, 6=SLONG
-        data_type = "UWORD"  # Default
+        dtype_map = {0: "UBYTE", 1: "UBYTE", 2: "SBYTE", 3: "UWORD", 4: "SWORD", 5: "ULONG", 6: "SLONG"}
         if self.version < self.NEW_FORMAT_VERSION:
             dtype_ind = self.data[name_end + 78] if name_end + 78 < len(self.data) else 3
         else:
             dtype_ind = self.data[name_end + 133] if name_end + 133 < len(self.data) else 3
-
-        dtype_map = {0: "UBYTE", 1: "UBYTE", 2: "SBYTE", 3: "UWORD", 4: "SWORD", 5: "ULONG", 6: "SLONG"}
         data_type = dtype_map.get(dtype_ind, "UWORD")
 
         # Read unit string and factor (position varies by version)
@@ -780,48 +913,40 @@ class OLSReader:
                 if not (1e-15 < abs(factor) < 1e15):
                     factor = 1.0
         else:
-            # New format: unit length at +141, unit at +145, factor follows unit
+            # New format (>= 400): unit at +145, factor at +146
             unit_len = self.data[name_end + 141] if name_end + 141 < len(self.data) else 0
             if 0 < unit_len < 20 and unit_len != 0xff:
                 unit_bytes = self.data[name_end + 145:name_end + 145 + unit_len]
-                unit = unit_bytes.decode('ascii', errors='replace').rstrip('\x00').strip()
-                factor_pos = name_end + 145 + unit_len
-            else:
-                factor_pos = name_end + 145
-            if factor_pos + 8 <= len(self.data):
-                factor = struct.unpack_from('<d', self.data, factor_pos)[0]
+                unit = unit_bytes.decode('cp1252', errors='replace').rstrip('\x00').strip()
+            # Factor is at fixed position +146
+            if name_end + 154 <= len(self.data):
+                factor = struct.unpack_from('<d', self.data, name_end + 146)[0]
                 if not (1e-15 < abs(factor) < 1e15):
                     factor = 1.0
 
-        # Extract offsets - format varies by version
+        # Extract offsets and axes - format varies by version
         data_offset = 0
         x_axis = None
         y_axis = None
 
         if self.version < self.NEW_FORMAT_VERSION:
             # Old format (< 300, e.g., v250): search for 0x80 marker pattern
-            # Pattern: 0x80 [addr:u16] [padding:u16] [addr2:u16]
-            # The marker position varies (typically 100-160) after parameter name
-
-            # Search for 0x80 marker followed by valid address pattern
             for check in range(100, 180):
                 if name_end + check + 7 <= len(self.data):
                     if self.data[name_end + check] == 0x80:
                         addr1 = self._read_u16(name_end + check + 1)
                         padding = self._read_u16(name_end + check + 3)
                         addr2 = self._read_u16(name_end + check + 5)
-                        # Pattern: 0x80 [addr] 00 00 [addr+delta]
                         if padding == 0 and 0x0100 <= addr1 <= 0xFFFF:
                             data_offset = addr1
-                            # For CURVE/MAP, addr2 is typically axis offset
-                            if param_type in ("CURVE", "MAP") and addr2 > addr1:
+                            if param_type in ("CURVE", "MAP", "MAP_INVERSE") and addr2 > addr1:
                                 points = cols if cols > 1 else rows
-                                x_axis = AxisInfo(points=points, offset=addr2)
-                                if param_type == "MAP" and rows > 1:
-                                    y_axis = AxisInfo(points=rows, offset=addr2 + cols)
+                                x_axis = AxisInfo(points=points, address=addr2)
+                                if param_type in ("MAP", "MAP_INVERSE") and rows > 1:
+                                    y_axis = AxisInfo(points=rows, address=addr2 + cols)
                             break
 
-            # Fallback: search for '0b 00' marker pattern (some files use this)
+            # Fallback: search for '0b 00' marker pattern
             if data_offset == 0:
                 for check in range(100, 160):
                     if name_end + check + 4 <= len(self.data):
@@ -832,60 +957,116 @@ class OLSReader:
                                 break
 
         elif self.version < self.NEWER_FORMAT_VERSION:
-            # Intermediate format (300-399): 0x80 flag at +163, 24-bit offsets at +164
+            # Intermediate format (300-399)
             if name_end + 172 <= len(self.data):
-                # Read 24-bit data offset at +164-166
                 data_offset = (self.data[name_end + 164] |
                               (self.data[name_end + 165] << 8) |
                               (self.data[name_end + 166] << 16))
-
-                if param_type in ("CURVE", "MAP"):
-                    # Read 24-bit axis offset at +168-170
+                if param_type in ("CURVE", "MAP", "MAP_INVERSE"):
                     xaxis_offset = (self.data[name_end + 168] |
                                    (self.data[name_end + 169] << 8) |
                                    (self.data[name_end + 170] << 16))
-
-                    x_axis = AxisInfo(points=cols, offset=xaxis_offset)
-                    if param_type == "MAP":
-                        y_axis = AxisInfo(points=rows, offset=xaxis_offset + cols)
+                    x_axis = AxisInfo(points=cols, address=xaxis_offset)
+                    if param_type in ("MAP", "MAP_INVERSE"):
+                        y_axis = AxisInfo(points=rows, address=xaxis_offset + cols)
         else:
-            # New format (>= 400): search for 0x80 flag in range 158-170, then read 24-bit offsets
-            if name_end + 175 <= len(self.data):
-                flag_found = False
-                flag_pos = 160  # Default position
+            # New format (>= 400): Full axis extraction
+            if name_end + 500 <= len(self.data):
+                # Data offset at +162 (after 0x80 marker at +161)
+                data_offset = (self.data[name_end + 162] |
+                              (self.data[name_end + 163] << 8) |
+                              (self.data[name_end + 164] << 16))
 
-                # Search for 0x80 flag in expected range
-                for check_pos in range(158, 170):
-                    if self.data[name_end + check_pos] == 0x80:
-                        flag_pos = check_pos
-                        flag_found = True
-                        break
+                # Validate data offset
+                if data_offset > 0x800000:
+                    data_offset = 0
 
-                # Read 24-bit data offset after flag
-                ofs_pos = flag_pos + 1
-                data_offset = (self.data[name_end + ofs_pos] |
-                              (self.data[name_end + ofs_pos + 1] << 8) |
-                              (self.data[name_end + ofs_pos + 2] << 16))
+                # Extract axis info for CURVE/MAP
+                if param_type in ("CURVE", "MAP", "MAP_INVERSE") and data_offset > 0:
+                    # Y-axis block starts at +202 (first axis, for MAP it's Y-axis)
+                    y_id, y_id_end = self._read_axis_string(name_end + 202)
 
-                # Validate offset (should be < 1MB for typical files)
-                if data_offset > 0x100000 and not flag_found:
-                    # No flag found and offset looks invalid, try fixed position
-                    data_offset = (self.data[name_end + 161] |
-                                  (self.data[name_end + 162] << 8) |
-                                  (self.data[name_end + 163] << 16))
-                    if data_offset > 0x100000:
-                        data_offset = 0
+                    if y_id and param_type in ("MAP", "MAP_INVERSE"):
+                        # Y-axis metadata follows ID string
+                        # Structure: 12 bytes padding, then data_source, unit, factor, offset, address
+                        y_base = y_id_end
+                        y_data_source = self._read_u32(y_base + 12) if y_base + 16 <= len(self.data) else 0
 
-                if param_type in ("CURVE", "MAP"):
-                    # Read 24-bit axis offset 4 bytes after data offset
-                    axis_ofs_pos = ofs_pos + 4
-                    xaxis_offset = (self.data[name_end + axis_ofs_pos] |
-                                   (self.data[name_end + axis_ofs_pos + 1] << 8) |
-                                   (self.data[name_end + axis_ofs_pos + 2] << 16))
+                        # Y-axis unit (2 bytes at +16 after ID end, e.g., "°C")
+                        y_unit = ""
+                        if y_base + 18 <= len(self.data):
+                            y_unit_bytes = self.data[y_base + 16:y_base + 18]
+                            y_unit = y_unit_bytes.decode('cp1252', errors='replace').rstrip('\x00')
 
-                    x_axis = AxisInfo(points=cols, offset=xaxis_offset)
-                    if param_type == "MAP":
-                        y_axis = AxisInfo(points=rows, offset=xaxis_offset + cols)
+                        # Y-axis factor at +18, offset at +26, address at +38
+                        y_factor = 1.0
+                        y_offset = 0.0
+                        y_addr = 0
+                        y_dtype = 3
+                        if y_base + 46 <= len(self.data):
+                            y_factor = struct.unpack_from('<d', self.data, y_base + 18)[0]
+                            y_offset = struct.unpack_from('<d', self.data, y_base + 26)[0]
+                            if not (1e-15 < abs(y_factor) < 1e15):
+                                y_factor = 1.0
+                            if not (-1e10 < y_offset < 1e10):
+                                y_offset = 0.0
+                            y_addr = self._read_u32(y_base + 38)
+                            y_dtype = self._read_u32(y_base + 42)
+
+                        y_axis = AxisInfo(
+                            points=rows,
+                            address=y_addr,
+                            offset=y_offset,
+                            unit=y_unit,
+                            factor=y_factor,
+                            id=y_id,
+                            description=y_id,  # Y-axis uses ID as description
+                            data_source=y_data_source,
+                            data_type=dtype_map.get(y_dtype, "UWORD"),
+                        )
+
+                    # X-axis block at fixed positions (description at +328, etc.)
+                    x_desc, x_desc_end = self._read_axis_string(name_end + 328)
+
+                    # X-axis unit at +375
+                    x_unit_len = self._read_u32(name_end + 375) if name_end + 379 <= len(self.data) else 0
+                    x_unit = ""
+                    if 0 < x_unit_len < 20:
+                        x_unit = self.data[name_end + 379:name_end + 379 + x_unit_len].decode('cp1252', errors='replace').rstrip('\x00')
+
+                    # X-axis factor at +382, address at +402
+                    x_factor = 1.0
+                    x_addr = 0
+                    if name_end + 410 <= len(self.data):
+                        x_factor = struct.unpack_from('<d', self.data, name_end + 382)[0]
+                        if not (1e-15 < abs(x_factor) < 1e15):
+                            x_factor = 1.0
+                        x_addr = self._read_u32(name_end + 402)
+
+                    # X-axis ID at +449
+                    x_id, _ = self._read_axis_string(name_end + 449)
+
+                    # For CURVE, the first axis block is actually X-axis
+                    if param_type == "CURVE":
+                        x_axis = AxisInfo(
+                            points=cols if cols > 1 else rows,
+                            address=x_addr if x_addr else (y_axis.address if y_axis else 0),
+                            unit=x_unit if x_unit else (y_axis.unit if y_axis else ""),
+                            factor=x_factor if x_factor != 1.0 else (y_axis.factor if y_axis else 1.0),
+                            id=x_id if x_id else (y_axis.id if y_axis else ""),
+                            description=x_desc if x_desc else (y_axis.description if y_axis else ""),
+                        )
+                        y_axis = None  # CURVE has no Y-axis
+                    else:
+                        # MAP/MAP_INVERSE: X-axis from second block
+                        x_axis = AxisInfo(
+                            points=cols,
+                            address=x_addr,
+                            unit=x_unit,
+                            factor=x_factor,
+                            id=x_id,
+                            description=x_desc,
+                        )
 
         # Extract description (search backwards from metadata)
         description = self._find_description_before(name_pos)
@@ -893,10 +1074,8 @@ class OLSReader:
         # Extract folder_id from metadata[5] (for v300+ files)
         folder_id = 0
         if self.version >= self.NEW_FORMAT_VERSION:
-            meta_start = name_pos - 24
             if meta_start >= 0:
                 folder_id = self._read_u32(meta_start + 20)  # metadata[5]
-                # Sanity check - folder IDs should be small
                 if folder_id > 1000:
                     folder_id = 0
 
@@ -913,6 +1092,7 @@ class OLSReader:
             unit=unit,
             factor=factor,
             folder_id=folder_id,
+            type_code=type_code,
         )
 
     def _find_description_before(self, name_pos: int) -> str:
