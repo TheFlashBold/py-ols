@@ -19,6 +19,7 @@ Supported OLS Versions:
     - v400-596: Standard format (parent ID based versions)
     - v597+:    Multi-version format (edit history with version slots)
     - v597+ KP: Map pack format with ZIP-compressed parameters
+    - v804:     WinOLS 5 format (15 metadata strings, derived version records)
 
 Usage:
     from ols_reader import read_ols, OLSReader
@@ -136,11 +137,22 @@ class CALBlock:
 class OLSFile:
     """Parsed OLS file contents"""
     filename: str
-    version: int = 0  # OLS format version (e.g., 250, 440, 478)
+    version: int = 0  # OLS format version (e.g., 250, 440, 478, 804)
     make: str = ""
     model: str = ""
     engine: str = ""
     year: str = ""
+    fuel_type: str = ""
+    displacement: str = ""
+    power: str = ""
+    gearbox: str = ""
+    memory_type: str = ""
+    ecu_manufacturer: str = ""
+    ecu_type: str = ""
+    sw_number: str = ""
+    hw_number: str = ""
+    hw_code: str = ""
+    user: str = ""
     parameters: list[Parameter] = field(default_factory=list)
     binary_versions: list[BinaryVersion] = field(default_factory=list)
     cal_block: Optional[CALBlock] = None
@@ -153,7 +165,7 @@ class OLSReader:
     """
     Reader for WinOLS .ols project files.
 
-    Supports OLS format versions 250 through 597+, including:
+    Supports OLS format versions 250 through 804+, including:
     - Parameter extraction with offsets, types, units, and conversion factors
     - Binary version extraction (Original, edit history)
     - CAL block extraction (Simos-specific)
@@ -451,7 +463,13 @@ class OLSReader:
         - [4-15]  Signature "WinOLS File"
         - [16-17] Version (u16)
         - [18-21] Flags (u32)
-        - [22+]   Length-prefixed strings: make, model, engine, year, fuel_type, power
+        - [22+]   Length-prefixed strings (up to 15):
+                   make, model, engine, year, fuel_type, displacement, power,
+                   gearbox, memory_type, ecu_manufacturer, ecu_type, sw_number,
+                   hw_number, hw_code, user
+
+        Older OLS versions may have fewer strings (minimum 4).
+        v597+ typically have all 15 strings (some may be empty).
         """
         # Check magic
         if self._read_u32(0) != 0x0b:
@@ -479,173 +497,233 @@ class OLSReader:
         pos += consumed
 
         ols.year, consumed = self._read_string(pos)
+        pos += consumed
+
+        # Extended metadata strings (v597+, up to 11 more)
+        # Each is length-prefixed; older files may stop early
+        extended_fields = [
+            'fuel_type', 'displacement', 'power', 'gearbox',
+            'memory_type', 'ecu_manufacturer', 'ecu_type',
+            'sw_number', 'hw_number', 'hw_code', 'user',
+        ]
+        for field_name in extended_fields:
+            if pos + 4 >= len(self.data):
+                break
+            val, consumed = self._read_string(pos)
+            if consumed <= 0:
+                break
+            # Stop if the length field looks like non-string data
+            # (length-prefixed strings should have length < 200)
+            raw_len = self._read_u32(pos)
+            if raw_len > 200:
+                break
+            setattr(ols, field_name, val)
+            pos += consumed
 
         return True
 
     def _extract_binary_versions(self) -> list[BinaryVersion]:
         """
-        Extract binary version entries (Daten, Original, NOCS, Hexdump, etc.)
+        Extract binary version entries (Original, Daten, NOCS, user-defined, etc.)
 
-        Binary versions are stored in the header area with structure that varies by version:
+        Binary versions are stored in the header area. Two formats exist:
+
+        v597+ format (including v804):
+            Base record (identified by 0x42007899 marker):
+                [version_index:4] [blob_offset:4] [blob_size:4] [0x42007899:4]
+                [version_count:4] [name_len:4] [name] [desc_len:4] [desc]
+
+            Derived record (for additional versions like user edits):
+                [0xFFFFFFFF:4] [name_len:4] [name] [desc_len:4] [desc]
+
+            Blob storage: blob_offset + i * blob_size for version i.
+            file_size == blob_offset + version_count * blob_size + 4 (0xFFFFFFFF trailer).
 
         Old format (version < 597):
-        - Root folders: 0x003fffff marker + length + name + child_count + child_list
-        - Child versions: [blob_offset at pos-12] [blob_size at pos-8] [timestamp] [parent_id] + length + name
-
-        New format (version >= 597):
-        - [0:4] [index:4] [metadata_offset:4] [blob_size:4] [timestamp:4] [count:4] [name_len:4] [name]
-        - Actual blob offset = blob_base + index * blob_size
-        - blob_base is typically at a 4MB-aligned boundary before first blob
+            Root folders: 0x003fffff marker + length + name
+            Child versions: [blob_offset at pos-12] [blob_size at pos-8] [parent_id] + length + name
         """
         versions = []
 
-        # Known version names that are valid binary versions
-        VALID_VERSION_NAMES = {'Daten', 'Daten 2', 'Original', 'NOCS', 'Hexdump', 'Binary data'}
-
-        # Start scanning after the header metadata area (skip to ~0x400)
-        pos = 0x400
+        # --- Try v597+ format: scan for 0x42007899 marker ---
+        BLOB_MARKER = 0x42007899
+        marker_bytes = struct.pack('<I', BLOB_MARKER)
+        scan_start = 0x100
         scan_end = min(0x2000, len(self.data) - 28)
 
-        while pos < scan_end:
-            # Try v597+ format: [0:4] [index:4] [metadata_offset:4] [blob_size:4] [timestamp:4] [count:4] [name_len:4] [name]
-            if pos + 32 <= len(self.data):
-                zero_field = self._read_u32(pos)
-                version_index = self._read_u32(pos + 4)
-                metadata_offset = self._read_u32(pos + 8)
-                blob_size = self._read_u32(pos + 12)
-                # timestamp at pos + 16 (skip)
-                version_count = self._read_u32(pos + 20)
-                name_len = self._read_u32(pos + 24)
+        base_found = False
+        marker_pos = self.data.find(marker_bytes, scan_start, scan_end)
 
-                # Validate v597 pattern: zero field, index < count, valid sizes
-                # Key difference from old format: version_count > 1 (old format has parent_id = 1)
-                # and index must be > 0 for a meaningful multi-version file
-                if (zero_field == 0 and
-                    version_index < 20 and
-                    version_count > 1 and version_count <= 20 and  # Must have >1 versions
-                    version_index < version_count and
-                    0x100000 < metadata_offset < len(self.data) and
-                    0x100000 <= blob_size <= 0x1000000 and  # 1MB to 16MB chunks (based on original binary size)
-                    0 < name_len < 50 and
-                    pos + 28 + name_len <= len(self.data)):
+        while marker_pos >= 0 and not base_found:
+            # Base record: marker is at offset +12 from record start
+            rec_start = marker_pos - 12
+            if rec_start < 0:
+                marker_pos = self.data.find(marker_bytes, marker_pos + 4, scan_end)
+                continue
 
-                    try:
-                        name = self.data[pos + 28:pos + 28 + name_len].decode('cp1252')
-                        if name.isprintable() and name.strip():
-                            name_clean = name.strip()
-                            if name_clean in VALID_VERSION_NAMES:
-                                # Calculate actual blob offset
-                                # Find blob base by looking for aligned boundary
-                                # Blobs are typically at 4MB-aligned addresses
-                                blob_base = (metadata_offset // blob_size) * blob_size
-                                if blob_base < metadata_offset:
-                                    blob_base += blob_size
-                                # Adjust to find actual first blob
-                                while blob_base > blob_size and blob_base - blob_size > metadata_offset:
-                                    blob_base -= blob_size
+            version_index = self._read_u32(rec_start)
+            blob_offset = self._read_u32(rec_start + 4)
+            blob_size = self._read_u32(rec_start + 8)
+            # marker at rec_start + 12
+            version_count = self._read_u32(rec_start + 16)
+            name_len = self._read_u32(rec_start + 20)
 
-                                actual_blob_offset = blob_base + version_index * blob_size
+            # Validate base record structure
+            if (version_index < 20 and
+                version_count > 0 and version_count <= 20 and
+                version_index < version_count and
+                0x100000 <= blob_size <= 0x1000000 and
+                blob_offset + version_count * blob_size <= len(self.data) + 4 and
+                0 < name_len < 50 and
+                rec_start + 24 + name_len <= len(self.data)):
 
-                                # Validate calculated offset - allow truncated last blob
-                                if actual_blob_offset >= len(self.data):
-                                    actual_blob_offset = metadata_offset  # Fallback only if start is past EOF
+                try:
+                    name = self.data[rec_start + 24:rec_start + 24 + name_len].decode('cp1252')
+                    if name.isprintable() and name.strip():
+                        name_clean = name.strip()
 
-                                # Try to read description after name
-                                desc = ""
-                                desc_pos = pos + 28 + name_len
-                                if desc_pos + 4 <= len(self.data):
-                                    desc_len = self._read_u32(desc_pos)
-                                    if 0 < desc_len < 500 and desc_pos + 4 + desc_len <= len(self.data):
-                                        desc_bytes = self.data[desc_pos + 4:desc_pos + 4 + desc_len]
-                                        desc = desc_bytes.decode('cp1252', errors='replace').strip()
+                        # Read description after name
+                        desc = ""
+                        desc_pos = rec_start + 24 + name_len
+                        if desc_pos + 4 <= len(self.data):
+                            desc_len = self._read_u32(desc_pos)
+                            if 0 < desc_len < 500 and desc_pos + 4 + desc_len <= len(self.data):
+                                desc = self.data[desc_pos + 4:desc_pos + 4 + desc_len].decode('cp1252', errors='replace').strip()
 
+                        actual_blob_offset = blob_offset + version_index * blob_size
+
+                        versions.append(BinaryVersion(
+                            name=name_clean,
+                            blob_offset=actual_blob_offset,
+                            blob_size=blob_size,
+                            version_index=version_index,
+                            version_count=version_count,
+                            description=desc,
+                        ))
+
+                        base_found = True
+
+                        # Scan forward for derived records (0xFFFFFFFF sentinel)
+                        derived_search_start = marker_pos + 4
+                        derived_search_end = min(derived_search_start + 0x500, len(self.data) - 8)
+                        derived_index = 0  # Next slot to assign
+
+                        d_pos = derived_search_start
+                        while d_pos < derived_search_end:
+                            if self._read_u32(d_pos) == 0xFFFFFFFF:
+                                if d_pos + 8 <= len(self.data):
+                                    d_name_len = self._read_u32(d_pos + 4)
+                                    if (0 < d_name_len < 50 and
+                                        d_pos + 8 + d_name_len <= len(self.data)):
+                                        try:
+                                            d_name = self.data[d_pos + 8:d_pos + 8 + d_name_len].decode('cp1252')
+                                            if d_name.isprintable() and d_name.strip():
+                                                # Skip base record's index
+                                                while derived_index == version_index:
+                                                    derived_index += 1
+                                                if derived_index >= version_count:
+                                                    break
+
+                                                d_desc = ""
+                                                d_desc_pos = d_pos + 8 + d_name_len
+                                                if d_desc_pos + 4 <= len(self.data):
+                                                    d_desc_len = self._read_u32(d_desc_pos)
+                                                    if 0 < d_desc_len < 500 and d_desc_pos + 4 + d_desc_len <= len(self.data):
+                                                        d_desc = self.data[d_desc_pos + 4:d_desc_pos + 4 + d_desc_len].decode('cp1252', errors='replace').strip()
+
+                                                d_blob_offset = blob_offset + derived_index * blob_size
+
+                                                versions.append(BinaryVersion(
+                                                    name=d_name.strip(),
+                                                    blob_offset=d_blob_offset,
+                                                    blob_size=blob_size,
+                                                    version_index=derived_index,
+                                                    version_count=version_count,
+                                                    description=d_desc,
+                                                ))
+
+                                                derived_index += 1
+                                                # Skip past this derived record
+                                                d_pos = d_desc_pos + (4 + d_desc_len if d_desc else 4)
+                                                continue
+                                        except (UnicodeDecodeError, ValueError):
+                                            pass
+                            d_pos += 1
+
+                except (UnicodeDecodeError, ValueError):
+                    pass
+
+            if not base_found:
+                marker_pos = self.data.find(marker_bytes, marker_pos + 4, scan_end)
+
+        # --- Fallback: old format (pre-v597 or files without 0x42007899 marker) ---
+        if not base_found:
+            pos = 0x400
+            old_scan_end = min(0x2000, len(self.data) - 28)
+
+            while pos < old_scan_end:
+                val = self._read_u32(pos)
+
+                # Root folder marker (0x003fffff)
+                if val == 0x003fffff:
+                    name_len = self._read_u32(pos + 4)
+                    if 0 < name_len < 50:
+                        try:
+                            name = self.data[pos + 8:pos + 8 + name_len].decode('cp1252')
+                            if name.isprintable() and name.strip():
                                 versions.append(BinaryVersion(
-                                    name=name_clean,
-                                    parent_id=None,
-                                    is_root=False,
-                                    description=desc,
-                                    blob_offset=actual_blob_offset,
-                                    blob_size=blob_size,
-                                    version_index=version_index,
-                                    version_count=version_count,
-                                ))
-                                pos += 28 + name_len
-                                continue
-                    except (UnicodeDecodeError, ValueError):
-                        pass
-
-            val = self._read_u32(pos)
-
-            # Check for root folder marker (0x003fffff)
-            if val == 0x003fffff:
-                name_len = self._read_u32(pos + 4)
-                if 0 < name_len < 50:
-                    try:
-                        name = self.data[pos + 8:pos + 8 + name_len].decode('cp1252')
-                        if name.isprintable() and name.strip():
-                            name_clean = name.strip()
-                            # Check if it's a known root folder name
-                            # Hexdump can be both a root folder and entry type for binary storage
-                            if any(name_clean.startswith(v) for v in ['Daten', 'Binary', 'Hexdump']):
-                                versions.append(BinaryVersion(
-                                    name=name_clean,
+                                    name=name.strip(),
                                     is_root=True,
                                     parent_id=None,
                                 ))
-                            pos += 8 + name_len
-                            continue
-                    except (UnicodeDecodeError, ValueError):
-                        pass
+                                pos += 8 + name_len
+                                continue
+                        except (UnicodeDecodeError, ValueError):
+                            pass
 
-            # Check for version with parent ID (small integer 1-10) - old format
-            # Must be preceded by size field and have a valid version name
-            if 0 < val <= 10:
-                name_len = self._read_u32(pos + 4)
-                if 0 < name_len < 50 and pos + 8 + name_len <= len(self.data):
-                    try:
-                        name = self.data[pos + 8:pos + 8 + name_len].decode('cp1252')
-                        if name.isprintable() and name.strip():
-                            name_clean = name.strip()
+                # Version with parent ID (small integer 1-10)
+                if 0 < val <= 10:
+                    name_len = self._read_u32(pos + 4)
+                    if 0 < name_len < 50 and pos + 8 + name_len <= len(self.data):
+                        try:
+                            name = self.data[pos + 8:pos + 8 + name_len].decode('cp1252')
+                            if name.isprintable() and name.strip():
+                                name_clean = name.strip()
 
-                            # Must be a known version name (not parameter or metadata)
-                            is_valid_version = name_clean in VALID_VERSION_NAMES
-
-                            if is_valid_version:
-                                # Try to read description
-                                desc = ""
-                                desc_pos = pos + 8 + name_len
-                                if desc_pos + 4 <= len(self.data):
-                                    desc_len = self._read_u32(desc_pos)
-                                    if 0 < desc_len < 500 and desc_pos + 4 + desc_len <= len(self.data):
-                                        desc_bytes = self.data[desc_pos + 4:desc_pos + 4 + desc_len]
-                                        desc = desc_bytes.decode('cp1252', errors='replace').strip()
-
-                                # Get blob_offset and blob_size (look back before parent_id)
-                                # Structure: [blob_index] [blob_offset] [blob_size] [timestamp] [parent_id]
+                                # Validate blob_offset and blob_size from preceding fields
                                 blob_offset = 0
                                 blob_size = 0
                                 if pos >= 16:
                                     blob_offset = self._read_u32(pos - 12)
                                     blob_size = self._read_u32(pos - 8)
-                                    # Validate - offset should be reasonable file position
                                     if blob_offset > len(self.data) or blob_size > 0x10000000:
                                         blob_offset = 0
                                         blob_size = 0
 
-                                versions.append(BinaryVersion(
-                                    name=name_clean,
-                                    parent_id=val,
-                                    is_root=False,
-                                    description=desc,
-                                    blob_offset=blob_offset,
-                                    blob_size=blob_size,
-                                ))
-                                pos += 8 + name_len
-                                continue
-                    except (UnicodeDecodeError, ValueError):
-                        pass
+                                # Only accept if we have valid blob info
+                                if blob_offset > 0 and blob_size > 0:
+                                    desc = ""
+                                    desc_pos = pos + 8 + name_len
+                                    if desc_pos + 4 <= len(self.data):
+                                        desc_len = self._read_u32(desc_pos)
+                                        if 0 < desc_len < 500 and desc_pos + 4 + desc_len <= len(self.data):
+                                            desc_bytes = self.data[desc_pos + 4:desc_pos + 4 + desc_len]
+                                            desc = desc_bytes.decode('cp1252', errors='replace').strip()
 
-            pos += 1
+                                    versions.append(BinaryVersion(
+                                        name=name_clean,
+                                        parent_id=val,
+                                        is_root=False,
+                                        description=desc,
+                                        blob_offset=blob_offset,
+                                        blob_size=blob_size,
+                                    ))
+                                    pos += 8 + name_len
+                                    continue
+                        except (UnicodeDecodeError, ValueError):
+                            pass
+
+                pos += 1
 
         # Find EPK/verification info for each binary version
         for v in versions:
@@ -1306,6 +1384,13 @@ if __name__ == "__main__":
     else:
         print("Type: OLS (Project file)")
     print(f"Vehicle: {ols.make} {ols.model} {ols.engine} ({ols.year})")
+    if ols.ecu_type:
+        ecu_info = ols.ecu_type
+        if ols.ecu_manufacturer:
+            ecu_info = f"{ols.ecu_manufacturer} {ecu_info}"
+        if ols.sw_number:
+            ecu_info += f", SW: {ols.sw_number}"
+        print(f"ECU: {ecu_info}")
     print(f"Parameters: {len(ols.parameters)}")
 
     # Count by type
