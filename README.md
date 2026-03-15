@@ -13,8 +13,6 @@ Extracts parameter definitions, CAL offsets, conversion factors, axis data, and 
 - v597+ KP: Map pack files (ZIP-compressed)
 - v804+: WinOLS 5 format
 
-Parameters are read sequentially in WinOLS's exact field order, so all version-specific fields are handled correctly.
-
 ## Usage
 
 ```python
