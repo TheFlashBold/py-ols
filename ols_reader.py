@@ -19,7 +19,7 @@ Supported OLS Versions:
     - v400-596: Standard format (parent ID based versions)
     - v597+:    Multi-version format (edit history with version slots)
     - v597+ KP: Map pack format with ZIP-compressed parameters
-    - v804:     WinOLS 5 format (15 metadata strings, derived version records)
+    - v804+:    WinOLS 5 format (15 metadata strings, derived version records)
 
 Usage:
     from ols_reader import read_ols, OLSReader
@@ -165,8 +165,8 @@ class OLSReader:
     """
     Reader for WinOLS .ols project files.
 
-    Supports OLS format versions 250 through 804+, including:
-    - Parameter extraction with offsets, types, units, and conversion factors
+    Supports OLS format versions 100 through 834+, including:
+    - Sequential parameter extraction (reads fields in WinOLS order)
     - Binary version extraction (Original, edit history)
     - CAL block extraction (Simos-specific)
 
@@ -188,16 +188,7 @@ class OLSReader:
         version: OLS format version (set during parsing)
     """
 
-    # Reference: Common parameter prefixes (not used for detection anymore)
-    # Detection now uses structural pattern matching which works for any naming convention
-    # Simos ECU: c_, kf_, kl_, ip_, lc_, id_, trq_, ign_, lam_, map_, tab_, etc.
-    # DSG/TCU: ges_, kad_, dam_, umw_, kan_, mmr_, tip_, kkr_, pag_, acc_, etc.
-    # DL501: Ahd_, Ges_, Gss_, Krm_, Umw_, Khs_, etc.
-
-    # Format version thresholds
-    # < 300: Old format (dims at +62/+66, flag at +106)
-    # 300-399: Intermediate format (dims at +118/+122, flag at +163, offset at +164)
-    # >= 400: New format (dims at +117/+121, flag at +160, offset at +161)
+    # Format version thresholds (for binary version / folder detection only)
     NEW_FORMAT_VERSION = 300
     NEWER_FORMAT_VERSION = 400
 
@@ -827,335 +818,416 @@ class OLSReader:
         # Default
         return 0
 
-    def _extract_parameters(self) -> list[Parameter]:
-        """
-        Extract parameter definitions from OLS file.
+    # -------------------------------------------------------------------
+    # Sequential reading primitives (advance self.pos)
+    # -------------------------------------------------------------------
 
-        OLS stores parameters with structure:
-        - Description string (length-prefixed)
-        - Zero padding
-        - Metadata (6 x u32 values) where meta[0] = type code (2=VALUE, 3=CURVE, 4+=MAP)
-        - Name string (length-prefixed)
-        - Post-name metadata (conversion, display settings)
+    def _seq_read_u8(self) -> int:
+        if self.pos + 1 > len(self.data):
+            raise EOFError(f"read_u8 at 0x{self.pos:x}")
+        val = self.data[self.pos]
+        self.pos += 1
+        return val
 
-        This method finds parameters by their structural pattern, not by name prefixes,
-        which allows it to work with any ECU type (Simos, DSG, etc.) regardless of
-        naming conventions.
-        """
-        parameters = []
-        found_names: set[str] = set()
+    def _seq_read_bool(self) -> bool:
+        return self._seq_read_u8() != 0
 
-        # Scan for metadata + name pattern
-        # Metadata is 6 x u32 (24 bytes) followed by name_len (u32) + name
-        pos = 0x100  # Skip file header
-        while pos < len(self.data) - 50:
-            try:
-                # Read potential metadata (6 x u32)
-                meta = struct.unpack_from('<6I', self.data, pos)
+    def _seq_read_u16(self) -> int:
+        if self.pos + 2 > len(self.data):
+            raise EOFError(f"read_u16 at 0x{self.pos:x}")
+        val = struct.unpack_from('<H', self.data, self.pos)[0]
+        self.pos += 2
+        return val
 
-                # Validate metadata pattern:
-                # meta[0] = type code (2=VALUE, 3=CURVE, 4+=MAP)
-                # meta[1-3] should be small values (often 1 for dimensions)
-                # meta[4] should be 0 or small (row/col related)
-                # meta[5] is often 0
-                type_code = meta[0]
-                if type_code in (2, 3) or 4 <= type_code <= 20:
-                    # Check that other values look reasonable
-                    if all(m < 1000 for m in meta[1:5]):
-                        # Check for name length at pos + 24
-                        name_pos = pos + 24
-                        if name_pos + 4 < len(self.data):
-                            name_len = self._read_u32(name_pos)
+    def _seq_read_u32(self) -> int:
+        if self.pos + 4 > len(self.data):
+            raise EOFError(f"read_u32 at 0x{self.pos:x}")
+        val = struct.unpack_from('<I', self.data, self.pos)[0]
+        self.pos += 4
+        return val
 
-                            if 2 < name_len < 100 and name_pos + 4 + name_len < len(self.data):
-                                try:
-                                    name = self.data[name_pos + 4:name_pos + 4 + name_len].decode('ascii')
+    def _seq_read_i32(self) -> int:
+        if self.pos + 4 > len(self.data):
+            raise EOFError(f"read_i32 at 0x{self.pos:x}")
+        val = struct.unpack_from('<i', self.data, self.pos)[0]
+        self.pos += 4
+        return val
 
-                                    # Validate name: must be alphanumeric with underscores, brackets
-                                    # and contain at least one underscore or be all uppercase
-                                    clean_name = name.replace('_', '').replace('[', '').replace(']', '').replace('.', '')
-                                    if (name.isprintable() and
-                                        clean_name.isalnum() and
-                                        len(name) >= 3 and
-                                        ('_' in name or name.isupper() or '.' in name) and
-                                        name not in found_names and
-                                        not name.startswith('WinOLS') and
-                                        not name.endswith('.ols')):
+    def _seq_read_f64(self) -> float:
+        if self.pos + 8 > len(self.data):
+            raise EOFError(f"read_f64 at 0x{self.pos:x}")
+        val = struct.unpack_from('<d', self.data, self.pos)[0]
+        self.pos += 8
+        return val
 
-                                        found_names.add(name)
-                                        param = self._parse_parameter_record(name_pos, name_len, name)
-                                        if param:
-                                            parameters.append(param)
-                                        pos = name_pos + 4 + name_len
-                                        continue
-                                except (UnicodeDecodeError, ValueError):
-                                    pass
-            except struct.error:
-                pass
-            pos += 1
+    def _seq_read_bytes(self, count: int) -> bytes:
+        if self.pos + count > len(self.data):
+            raise EOFError(f"read_bytes({count}) at 0x{self.pos:x}")
+        result = self.data[self.pos:self.pos + count]
+        self.pos += count
+        return result
 
-        return parameters
+    def _seq_read_array(self) -> bytes:
+        """Read u32(byte_count) + byte_count bytes."""
+        count = self._seq_read_u32()
+        if count == 0 or count >= 0xFFFFFFF0:
+            return b""
+        if count > 0x1000000:
+            raise ValueError(f"read_array at 0x{self.pos:x}: count {count}")
+        if self.pos + count > len(self.data):
+            raise EOFError(f"read_array at 0x{self.pos:x}: need {count}")
+        result = self.data[self.pos:self.pos + count]
+        self.pos += count
+        return result
 
-    def _read_axis_string(self, pos: int) -> tuple[str, int]:
-        """Read a length-prefixed string at position, return (string, end_position)"""
-        if pos + 4 > len(self.data):
-            return "", pos
-        strlen = self._read_u32(pos)
-        if strlen == 0 or strlen > 200:
-            return "", pos + 4
-        end = pos + 4 + strlen
-        if end > len(self.data):
-            return "", pos + 4
-        s = self.data[pos + 4:end].decode('cp1252', errors='replace').rstrip('\x00')
-        return s, end
+    def _seq_read_u32_array(self) -> list[int]:
+        count = self._seq_read_u32()
+        if count == 0:
+            return []
+        if count > 0x100000:
+            raise ValueError(f"read_u32_array: count {count}")
+        return [self._seq_read_u32() for _ in range(count)]
 
-    def _parse_parameter_record(self, name_pos: int, name_len: int, name: str) -> Optional[Parameter]:
-        """
-        Parse a single parameter record.
-
-        Structure varies by OLS version:
-
-        Older format (version < 300):
-        - Dimensions at +62/+66 as u16
-        - Flag 0x8000 around +106, followed by 16-bit offsets
-
-        Newer format (version >= 400):
-        - Dimensions at +117 (cols) and +121 (rows) as single bytes
-        - Factor at +146 (8 bytes double)
-        - Marker 0x80 at +161, data offset at +162
-        - Y-axis block at +202: ID, data_source, unit, factor, offset, address
-        - X-axis block at +328: description, unit, factor, address, ID
-        """
-        name_end = name_pos + 4 + name_len
-
-        if name_end + 180 > len(self.data):
-            return Parameter(name=name)
-
-        # Get type_code from metadata
-        meta_start = name_pos - 24
-        type_code = self._read_u32(meta_start) if meta_start >= 0 else 0
-
-        # Read dimensions - position and format varies by OLS version
-        if self.version < self.NEW_FORMAT_VERSION:
-            # Old format (< 300): u16 at +62/+66
-            cols = self._read_u16(name_end + 62)
-            rows = self._read_u16(name_end + 66)
-        elif self.version < self.NEWER_FORMAT_VERSION:
-            # Intermediate format (300-399): single byte at +118 and +122
-            cols = self.data[name_end + 118]
-            rows = self.data[name_end + 122]
+    def _seq_read_string(self) -> str:
+        """Read version-aware length-prefixed string."""
+        length = self._seq_read_u32()
+        if length == 0 or length >= 0xFFFFFFF0:
+            return ""
+        if length > 0x100000:
+            raise ValueError(f"read_string at 0x{self.pos:x}: length {length}")
+        if self.pos + length > len(self.data):
+            raise EOFError(f"read_string at 0x{self.pos:x}: need {length}")
+        raw = self.data[self.pos:self.pos + length]
+        if self._has_feature(439):
+            self.pos += length
         else:
-            # New format (>= 400): single byte at +117 and +121
-            cols = self.data[name_end + 117]
-            rows = self.data[name_end + 121]
+            self.pos += length + 1
+        return raw.decode('cp1252', errors='replace').rstrip('\x00')
 
-        # Sanity check dimensions
-        if cols > 100 or rows > 100 or cols == 0:
+    def _seq_read_string_array(self) -> list[str]:
+        count = self._seq_read_u32()
+        return [self._seq_read_string() for _ in range(count)]
+
+    def _seq_read_lang_string(self) -> str:
+        s = self._seq_read_string()
+        if self._has_feature(345):
+            self._seq_read_u32()  # lang_id
+        return s
+
+    def _seq_read_multi_lang_string(self) -> str:
+        if not self._has_feature(330):
+            return self._seq_read_string()
+        primary = self._seq_read_lang_string()
+        if self._has_feature(345):
+            self._seq_read_u32()  # flags
+        sub_count = self._seq_read_u32()
+        for _ in range(sub_count):
+            self._seq_read_lang_string()
+        return primary
+
+    def _has_feature(self, feature_id: int) -> bool:
+        return feature_id <= self.version
+
+    # -------------------------------------------------------------------
+    # Sequential map list detection
+    # -------------------------------------------------------------------
+
+    def _find_map_list_start(self) -> Optional[tuple[int, int]]:
+        """
+        Find the map list start position and count.
+
+        The map list is preceded by checksum 0x11883377, then:
+        - compressed (bool/u8)
+        - count (u32)
+        - map records
+
+        Returns (first_map_pos, map_count) or None.
+        """
+        needle = struct.pack('<I', 0x11883377)
+        idx = self.data.find(needle, 0x100, 0x20000)
+        if idx < 0:
+            return None
+
+        pos = idx + 4
+        if pos + 5 > len(self.data):
+            return None
+
+        compressed = self.data[pos]
+        count = struct.unpack_from('<I', self.data, pos + 1)[0]
+        first_map = pos + 5
+
+        if compressed:
+            return None
+
+        if count == 0 or count > 0x100000:
+            return None
+
+        return (first_map, count)
+
+    # -------------------------------------------------------------------
+    # Sequential axis unit descriptor reader
+    # -------------------------------------------------------------------
+
+    def _seq_read_axis_unit_desc(self) -> tuple[str, float, float, int, int]:
+        """
+        Read axis unit descriptor.
+        Returns (unit, factor, offset, data_offset, end_offset).
+        """
+        unit = self._seq_read_string()
+        self._seq_read_string()  # alt_unit
+        factor = self._seq_read_f64()
+        offset = self._seq_read_f64()
+        data_offset = self._seq_read_u32()
+        end_offset = self._seq_read_u32()
+        self._seq_read_u32()  # field_4c
+        if self._has_feature(264):
+            self._seq_read_f64()
+        if self._has_feature(61):
+            self._seq_read_u32()
+        if self._has_feature(105):
+            self._seq_read_u32()
+            self._seq_read_u32()
+            self._seq_read_u32()
+            self._seq_read_i32()
+        return (unit, factor, offset, data_offset, end_offset)
+
+    # -------------------------------------------------------------------
+    # Sequential axis data reader
+    # -------------------------------------------------------------------
+
+    def _seq_read_axis_data(self) -> AxisInfo:
+        """Read a single axis data block."""
+        description = self._seq_read_multi_lang_string()
+        axis_id = self._seq_read_string()
+        factor = self._seq_read_f64()
+        offset = self._seq_read_f64()
+        type_code = self._seq_read_u32()
+        self._seq_read_u32()
+        self._seq_read_u32()
+        self._seq_read_u32()
+        data_format = self._seq_read_u32()
+        if data_format not in (2, 10, 16):
+            data_format = 10
+        data_type = {2: "UBYTE", 10: "UWORD", 16: "ULONG"}.get(data_format, "UWORD")
+        self._seq_read_bool()
+        self._seq_read_bool()
+        if self._has_feature(264):
+            self._seq_read_f64()
+        if self._has_feature(241):
+            self._seq_read_u32()
+        data_source = 0
+        if self._has_feature(8):
+            data_source = self._seq_read_u32()
+        if self._has_feature(805):
+            self._seq_read_u32()
+        if self._has_feature(12):
+            self._seq_read_bool()
+        if self._has_feature(73):
+            self._seq_read_array()
+        if self._has_feature(77):
+            self._seq_read_u32()
+        if self._has_feature(91):
+            self._seq_read_i32()
+        if self._has_feature(354):
+            self._seq_read_string()
+        if self._has_feature(372):
+            count_372 = self._seq_read_u32()
+            for _ in range(count_372):
+                self._seq_read_multi_lang_string()
+        if self._has_feature(440):
+            self._seq_read_i32()
+        if self._has_feature(805):
+            self._seq_read_u32()
+            self._seq_read_u32()
+            self._seq_read_u32()
+            self._seq_read_u32()
+        return AxisInfo(
+            points=0,
+            unit="",
+            factor=factor,
+            offset=offset,
+            id=axis_id,
+            description=description,
+            data_source=data_source,
+            data_type=data_type,
+        )
+
+    # -------------------------------------------------------------------
+    # Sequential map reader
+    # -------------------------------------------------------------------
+
+    def _seq_read_one_map(self) -> Parameter:
+        """Read a single map record sequentially."""
+        if self._has_feature(268):
+            self._seq_read_u8()
+        if self._has_feature(282):
+            self._seq_read_u32()
+        alt_description = ""
+        if self._has_feature(287):
+            alt_description = self._seq_read_multi_lang_string()
+        if self._has_feature(93):
+            self._seq_read_u8()
+
+        description = self._seq_read_multi_lang_string()
+        type_code = self._seq_read_u32()
+        self._seq_read_u32()
+        self._seq_read_u32()
+        self._seq_read_u32()
+        raw_ds = self._seq_read_u32()
+        data_size = raw_ds if raw_ds in (2, 10, 16) else 10
+        data_type = {2: "UBYTE", 10: "UWORD", 16: "ULONG"}.get(data_size, "UWORD")
+
+        name = ""
+        folder_id = 0
+        if self._has_feature(80):
+            folder_id = self._seq_read_u32()
+            if folder_id > 1000:
+                folder_id = 0
+            name = self._seq_read_string()
+        if self._has_feature(298):
+            self._seq_read_u32()
+        if self._has_feature(299):
+            self._seq_read_u32()
+        if self._has_feature(94):
+            self._seq_read_u32()
+        if self._has_feature(74):
+            self._seq_read_bool()
+
+        # File mode check (OLS files always use mode 1)
+        file_mode = 1
+        if file_mode == 1:
+            if self._has_feature(123):
+                self._seq_read_u32()
+        elif file_mode == 3:
+            if self._has_feature(221):
+                self._seq_read_u32()
+
+        if self._has_feature(300):
+            for _ in range(6):
+                self._seq_read_f64()
+        if self._has_feature(67):
+            if self._has_feature(300):
+                for _ in range(6):
+                    self._seq_read_f64()
+            else:
+                for _ in range(6):
+                    self._seq_read_f64()
+        elif self._has_feature(66):
+            self._seq_read_f64()
+            self._seq_read_f64()
+        elif not self._has_feature(59):
+            self._seq_read_u32()
+            self._seq_read_u32()
+
+        for _ in range(4):
+            self._seq_read_bool()
+
+        dim1 = self._seq_read_u32()
+        dim2 = self._seq_read_u32()
+        self._seq_read_u32()
+        self._seq_read_u32()
+        self._seq_read_u32()
+
+        # Axis unit descriptor
+        unit_str, factor, conv_offset, data_offset, axis_offset = self._seq_read_axis_unit_desc()
+
+        # Two axis data blocks
+        axis1 = self._seq_read_axis_data()
+        axis2 = self._seq_read_axis_data()
+
+        if dim1 > 0x4000:
+            dim1 = 0x4000
+
+        if self._has_feature(58):
+            self._seq_read_bool()
+        if self._has_feature(68):
+            self._seq_read_bool()
+        if self._has_feature(90):
+            self._seq_read_u32()
+        if self._has_feature(9):
+            self._seq_read_u32()
+            self._seq_read_u32()
+        if self._has_feature(49):
+            self._seq_read_u32()
+            self._seq_read_bool()
+            self._seq_read_bool()
+            self._seq_read_f64()
+            self._seq_read_f64()
+        if self._has_feature(51):
+            self._seq_read_u32()
+        if self._has_feature(53):
+            self._seq_read_bool()
+            self._seq_read_f64()
+            self._seq_read_f64()
+            self._seq_read_f64()
+            self._seq_read_u32()
+        if self._has_feature(54):
+            self._seq_read_f64()
+        if self._has_feature(55):
+            self._seq_read_bool()
+            self._seq_read_bool()
+            self._seq_read_bool()
+        if self._has_feature(315):
+            self._seq_read_u32()
+        if self._has_feature(383):
+            self._seq_read_i32()
+            self._seq_read_bytes(16)
+        if self._has_feature(329):
+            self._seq_read_u32()
+        if self._has_feature(346):
+            self._seq_read_u32()
+            self._seq_read_u32()
+        if self._has_feature(395):
+            self._seq_read_u32()
+        if self._has_feature(476):
+            self._seq_read_u32()
+            self._seq_read_u32_array()
+            self._seq_read_string_array()
+        if self._has_feature(503):
+            self._seq_read_u32()
+            self._seq_read_f64()
+        if self._has_feature(596):
+            self._seq_read_u32()
+
+        # Derive parameter type
+        type_map = {1: "VALUE", 2: "VALUE", 3: "CURVE", 4: "MAP", 5: "MAP"}
+        param_type = type_map.get(type_code, "MAP" if type_code > 5 else "VALUE")
+
+        # Derive dimensions
+        if type_code <= 2:
+            cols = max(1, dim1)
+            rows = 1
+        elif type_code == 3:
+            cols = max(1, dim1)
+            rows = 1
+        else:
+            cols = max(1, dim1)
+            rows = max(1, dim2)
+        if cols > 0x4000:
             cols = 1
-        if rows > 100 or rows == 0:
+        if rows > 0x4000:
             rows = 1
 
-        # Determine parameter type from type_code or dimensions
-        # type_code: 2=VALUE, 3=CURVE, 4=MAP, 5=MAP_INVERSE
-        if type_code == 5:
-            param_type = "MAP_INVERSE"
-        elif type_code == 4 or (cols > 1 and rows > 1):
-            param_type = "MAP"
-        elif type_code == 3 or cols > 1 or rows > 1:
-            param_type = "CURVE"
-        else:
-            param_type = "VALUE"
-
-        # Read data type indicator and determine data_type string
-        # Data type indicator: 0/1=UBYTE, 2=SBYTE, 3=UWORD, 4=SWORD, 5=ULONG, 6=SLONG
-        dtype_map = {0: "UBYTE", 1: "UBYTE", 2: "SBYTE", 3: "UWORD", 4: "SWORD", 5: "ULONG", 6: "SLONG"}
-        if self.version < self.NEW_FORMAT_VERSION:
-            dtype_ind = self.data[name_end + 78] if name_end + 78 < len(self.data) else 3
-        else:
-            dtype_ind = self.data[name_end + 133] if name_end + 133 < len(self.data) else 3
-        data_type = dtype_map.get(dtype_ind, "UWORD")
-
-        # Read unit string and factor (position varies by version)
-        unit = ""
-        factor = 1.0
-        if self.version < self.NEW_FORMAT_VERSION:
-            # Old format: unit length at +86, unit at +90, factor follows unit
-            unit_len = self.data[name_end + 86] if name_end + 86 < len(self.data) else 0
-            if 0 < unit_len < 20:
-                unit_bytes = self.data[name_end + 90:name_end + 90 + unit_len]
-                unit = unit_bytes.decode('ascii', errors='replace').rstrip('\x00').strip()
-            # Factor at 4-byte aligned position after unit (around +92)
-            factor_pos = name_end + 92
-            if factor_pos + 8 <= len(self.data):
-                factor = struct.unpack_from('<d', self.data, factor_pos)[0]
-                if not (1e-15 < abs(factor) < 1e15):
-                    factor = 1.0
-        else:
-            # New format (>= 400): unit at +145, factor at +146
-            unit_len = self.data[name_end + 141] if name_end + 141 < len(self.data) else 0
-            if 0 < unit_len < 20 and unit_len != 0xff:
-                unit_bytes = self.data[name_end + 145:name_end + 145 + unit_len]
-                unit = unit_bytes.decode('cp1252', errors='replace').rstrip('\x00').strip()
-            # Factor is at fixed position +146
-            if name_end + 154 <= len(self.data):
-                factor = struct.unpack_from('<d', self.data, name_end + 146)[0]
-                if not (1e-15 < abs(factor) < 1e15):
-                    factor = 1.0
-
-        # Extract offsets and axes - format varies by version
-        data_offset = 0
+        # Assign axes
         x_axis = None
         y_axis = None
+        if param_type == "CURVE":
+            x_axis = axis1
+            if x_axis:
+                x_axis.points = cols
+                x_axis.address = axis_offset
+        elif param_type == "MAP":
+            y_axis = axis1
+            x_axis = axis2
+            if y_axis:
+                y_axis.points = rows
+                y_axis.address = axis_offset
+            if x_axis:
+                x_axis.points = cols
 
-        if self.version < self.NEW_FORMAT_VERSION:
-            # Old format (< 300, e.g., v250): search for 0x80 marker pattern
-            for check in range(100, 180):
-                if name_end + check + 7 <= len(self.data):
-                    if self.data[name_end + check] == 0x80:
-                        addr1 = self._read_u16(name_end + check + 1)
-                        padding = self._read_u16(name_end + check + 3)
-                        addr2 = self._read_u16(name_end + check + 5)
-                        if padding == 0 and 0x0100 <= addr1 <= 0xFFFF:
-                            data_offset = addr1
-                            if param_type in ("CURVE", "MAP", "MAP_INVERSE") and addr2 > addr1:
-                                points = cols if cols > 1 else rows
-                                x_axis = AxisInfo(points=points, address=addr2)
-                                if param_type in ("MAP", "MAP_INVERSE") and rows > 1:
-                                    y_axis = AxisInfo(points=rows, address=addr2 + cols)
-                            break
-
-            # Fallback: search for '0b 00' marker pattern
-            if data_offset == 0:
-                for check in range(100, 160):
-                    if name_end + check + 4 <= len(self.data):
-                        if self.data[name_end + check] == 0x0b and self.data[name_end + check + 1] == 0x00:
-                            addr = self._read_u16(name_end + check + 2)
-                            if 0x0100 <= addr <= 0xFFFF:
-                                data_offset = addr
-                                break
-
-        elif self.version < self.NEWER_FORMAT_VERSION:
-            # Intermediate format (300-399)
-            if name_end + 172 <= len(self.data):
-                data_offset = (self.data[name_end + 164] |
-                              (self.data[name_end + 165] << 8) |
-                              (self.data[name_end + 166] << 16))
-                if param_type in ("CURVE", "MAP", "MAP_INVERSE"):
-                    xaxis_offset = (self.data[name_end + 168] |
-                                   (self.data[name_end + 169] << 8) |
-                                   (self.data[name_end + 170] << 16))
-                    x_axis = AxisInfo(points=cols, address=xaxis_offset)
-                    if param_type in ("MAP", "MAP_INVERSE"):
-                        y_axis = AxisInfo(points=rows, address=xaxis_offset + cols)
-        else:
-            # New format (>= 400): Full axis extraction
-            if name_end + 500 <= len(self.data):
-                # Data offset at +162 (after 0x80 marker at +161)
-                data_offset = (self.data[name_end + 162] |
-                              (self.data[name_end + 163] << 8) |
-                              (self.data[name_end + 164] << 16))
-
-                # Validate data offset
-                if data_offset > 0x800000:
-                    data_offset = 0
-
-                # Extract axis info for CURVE/MAP
-                if param_type in ("CURVE", "MAP", "MAP_INVERSE") and data_offset > 0:
-                    # Y-axis block starts at +202 (first axis, for MAP it's Y-axis)
-                    y_id, y_id_end = self._read_axis_string(name_end + 202)
-
-                    if y_id and param_type in ("MAP", "MAP_INVERSE"):
-                        # Y-axis metadata follows ID string
-                        # Structure: 12 bytes padding, then data_source, unit, factor, offset, address
-                        y_base = y_id_end
-                        y_data_source = self._read_u32(y_base + 12) if y_base + 16 <= len(self.data) else 0
-
-                        # Y-axis unit (2 bytes at +16 after ID end, e.g., "°C")
-                        y_unit = ""
-                        if y_base + 18 <= len(self.data):
-                            y_unit_bytes = self.data[y_base + 16:y_base + 18]
-                            y_unit = y_unit_bytes.decode('cp1252', errors='replace').rstrip('\x00')
-
-                        # Y-axis factor at +18, offset at +26, address at +38
-                        y_factor = 1.0
-                        y_offset = 0.0
-                        y_addr = 0
-                        y_dtype = 3
-                        if y_base + 46 <= len(self.data):
-                            y_factor = struct.unpack_from('<d', self.data, y_base + 18)[0]
-                            y_offset = struct.unpack_from('<d', self.data, y_base + 26)[0]
-                            if not (1e-15 < abs(y_factor) < 1e15):
-                                y_factor = 1.0
-                            if not (-1e10 < y_offset < 1e10):
-                                y_offset = 0.0
-                            y_addr = self._read_u32(y_base + 38)
-                            y_dtype = self._read_u32(y_base + 42)
-
-                        y_axis = AxisInfo(
-                            points=rows,
-                            address=y_addr,
-                            offset=y_offset,
-                            unit=y_unit,
-                            factor=y_factor,
-                            id=y_id,
-                            description=y_id,  # Y-axis uses ID as description
-                            data_source=y_data_source,
-                            data_type=dtype_map.get(y_dtype, "UWORD"),
-                        )
-
-                    # X-axis block at fixed positions (description at +328, etc.)
-                    x_desc, x_desc_end = self._read_axis_string(name_end + 328)
-
-                    # X-axis unit at +375
-                    x_unit_len = self._read_u32(name_end + 375) if name_end + 379 <= len(self.data) else 0
-                    x_unit = ""
-                    if 0 < x_unit_len < 20:
-                        x_unit = self.data[name_end + 379:name_end + 379 + x_unit_len].decode('cp1252', errors='replace').rstrip('\x00')
-
-                    # X-axis factor at +382, address at +402
-                    x_factor = 1.0
-                    x_addr = 0
-                    if name_end + 410 <= len(self.data):
-                        x_factor = struct.unpack_from('<d', self.data, name_end + 382)[0]
-                        if not (1e-15 < abs(x_factor) < 1e15):
-                            x_factor = 1.0
-                        x_addr = self._read_u32(name_end + 402)
-
-                    # X-axis ID at +449
-                    x_id, _ = self._read_axis_string(name_end + 449)
-
-                    # For CURVE, the first axis block is actually X-axis
-                    if param_type == "CURVE":
-                        x_axis = AxisInfo(
-                            points=cols if cols > 1 else rows,
-                            address=x_addr if x_addr else (y_axis.address if y_axis else 0),
-                            unit=x_unit if x_unit else (y_axis.unit if y_axis else ""),
-                            factor=x_factor if x_factor != 1.0 else (y_axis.factor if y_axis else 1.0),
-                            id=x_id if x_id else (y_axis.id if y_axis else ""),
-                            description=x_desc if x_desc else (y_axis.description if y_axis else ""),
-                        )
-                        y_axis = None  # CURVE has no Y-axis
-                    else:
-                        # MAP/MAP_INVERSE: X-axis from second block
-                        x_axis = AxisInfo(
-                            points=cols,
-                            address=x_addr,
-                            unit=x_unit,
-                            factor=x_factor,
-                            id=x_id,
-                            description=x_desc,
-                        )
-
-        # Extract description (search backwards from metadata)
-        description = self._find_description_before(name_pos)
-
-        # Extract folder_id from metadata[5] (for v300+ files)
-        folder_id = 0
-        if self.version >= self.NEW_FORMAT_VERSION:
-            if meta_start >= 0:
-                folder_id = self._read_u32(meta_start + 20)  # metadata[5]
-                if folder_id > 1000:
-                    folder_id = 0
+        # OLS data_offset points 2 entries before actual cell data
+        type_size = {2: 1, 10: 2, 16: 4}.get(data_size, 2)
+        adjusted_offset = data_offset + 2 * type_size if data_offset > 0 else 0
 
         return Parameter(
             name=name,
@@ -1164,47 +1236,43 @@ class OLSReader:
             data_type=data_type,
             cols=cols,
             rows=rows,
-            data_offset=data_offset,
+            data_offset=adjusted_offset,
             x_axis=x_axis,
             y_axis=y_axis,
-            unit=unit,
+            unit=unit_str,
             factor=factor,
-            folder_id=folder_id,
+            offset=conv_offset,
             type_code=type_code,
+            folder_id=folder_id,
         )
 
-    def _find_description_before(self, name_pos: int) -> str:
-        """Find length-prefixed description string before parameter name"""
-        # Metadata is 24 bytes before name, description is before that
-        meta_start = name_pos - 24
-        if meta_start < 4:
-            return ""
+    # -------------------------------------------------------------------
+    # Parameter extraction (sequential)
+    # -------------------------------------------------------------------
 
-        # Skip trailing zeros to find description end
-        desc_end = meta_start
-        while desc_end > 0 and self.data[desc_end - 1] == 0:
-            desc_end -= 1
+    def _extract_parameters(self) -> list[Parameter]:
+        """
+        Extract parameter definitions by reading the map list sequentially.
 
-        if desc_end < 10:
-            return ""
+        Locates the map list via the 0x11883377 checksum marker, then reads
+        each map record field-by-field in the exact order WinOLS uses.
+        """
+        found = self._find_map_list_start()
+        if found is None:
+            return []
 
-        # Search backwards for length-prefixed string
-        for back in range(1, min(500, desc_end)):
-            check_pos = desc_end - back
-            if check_pos < 4:
+        first_map_pos, map_count = found
+        self.pos = first_map_pos
+        parameters = []
+
+        for _ in range(map_count):
+            try:
+                p = self._seq_read_one_map()
+                parameters.append(p)
+            except (EOFError, ValueError, struct.error):
                 break
 
-            try:
-                str_len = self._read_u32(check_pos)
-                if 10 < str_len < 500 and check_pos + 4 + str_len <= desc_end:
-                    desc = self.data[check_pos + 4:check_pos + 4 + str_len]
-                    desc = desc.decode('cp1252', errors='replace').strip()
-                    if desc and all(c.isprintable() or c == ' ' for c in desc):
-                        return desc
-            except (struct.error, ValueError):
-                pass
-
-        return ""
+        return parameters
 
     def _extract_cal_block(self) -> Optional[CALBlock]:
         """
