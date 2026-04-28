@@ -517,26 +517,21 @@ class OLSReader:
         """
         Extract binary version entries (Original, Daten, NOCS, user-defined, etc.)
 
-        Binary versions are stored in the header area. Two formats exist:
+        WinOLS uses a single record format across all observed versions (v100..v804+),
+        identified by the 0x42007899 class marker:
 
-        v597+ format (including v804):
-            Base record (identified by 0x42007899 marker):
+            Base record:
                 [version_index:4] [blob_offset:4] [blob_size:4] [0x42007899:4]
                 [version_count:4] [name_len:4] [name] [desc_len:4] [desc]
 
             Derived record (for additional versions like user edits):
                 [0xFFFFFFFF:4] [name_len:4] [name] [desc_len:4] [desc]
 
-            Blob storage: blob_offset + i * blob_size for version i.
+            Blob storage layout: blob_offset + i * blob_size for version i.
             file_size == blob_offset + version_count * blob_size + 4 (0xFFFFFFFF trailer).
-
-        Old format (version < 597):
-            Root folders: 0x003fffff marker + length + name
-            Child versions: [blob_offset at pos-12] [blob_size at pos-8] [parent_id] + length + name
         """
         versions = []
 
-        # --- Try v597+ format: scan for 0x42007899 marker ---
         BLOB_MARKER = 0x42007899
         marker_bytes = struct.pack('<I', BLOB_MARKER)
         scan_start = 0x100
@@ -563,7 +558,7 @@ class OLSReader:
             if (version_index < 20 and
                 version_count > 0 and version_count <= 20 and
                 version_index < version_count and
-                0x100000 <= blob_size <= 0x1000000 and
+                0x10000 <= blob_size <= 0x10000000 and
                 blob_offset + version_count * blob_size <= len(self.data) + 4 and
                 0 < name_len < 50 and
                 rec_start + 24 + name_len <= len(self.data)):
@@ -646,75 +641,6 @@ class OLSReader:
 
             if not base_found:
                 marker_pos = self.data.find(marker_bytes, marker_pos + 4, scan_end)
-
-        # --- Fallback: old format (pre-v597 or files without 0x42007899 marker) ---
-        if not base_found:
-            pos = 0x400
-            old_scan_end = min(0x2000, len(self.data) - 28)
-
-            while pos < old_scan_end:
-                val = self._read_u32(pos)
-
-                # Root folder marker (0x003fffff)
-                if val == 0x003fffff:
-                    name_len = self._read_u32(pos + 4)
-                    if 0 < name_len < 50:
-                        try:
-                            name = self.data[pos + 8:pos + 8 + name_len].decode('cp1252')
-                            if name.isprintable() and name.strip():
-                                versions.append(BinaryVersion(
-                                    name=name.strip(),
-                                    is_root=True,
-                                    parent_id=None,
-                                ))
-                                pos += 8 + name_len
-                                continue
-                        except (UnicodeDecodeError, ValueError):
-                            pass
-
-                # Version with parent ID (small integer 1-10)
-                if 0 < val <= 10:
-                    name_len = self._read_u32(pos + 4)
-                    if 0 < name_len < 50 and pos + 8 + name_len <= len(self.data):
-                        try:
-                            name = self.data[pos + 8:pos + 8 + name_len].decode('cp1252')
-                            if name.isprintable() and name.strip():
-                                name_clean = name.strip()
-
-                                # Validate blob_offset and blob_size from preceding fields
-                                blob_offset = 0
-                                blob_size = 0
-                                if pos >= 16:
-                                    blob_offset = self._read_u32(pos - 12)
-                                    blob_size = self._read_u32(pos - 8)
-                                    if blob_offset > len(self.data) or blob_size > 0x10000000:
-                                        blob_offset = 0
-                                        blob_size = 0
-
-                                # Only accept if we have valid blob info
-                                if blob_offset > 0 and blob_size > 0:
-                                    desc = ""
-                                    desc_pos = pos + 8 + name_len
-                                    if desc_pos + 4 <= len(self.data):
-                                        desc_len = self._read_u32(desc_pos)
-                                        if 0 < desc_len < 500 and desc_pos + 4 + desc_len <= len(self.data):
-                                            desc_bytes = self.data[desc_pos + 4:desc_pos + 4 + desc_len]
-                                            desc = desc_bytes.decode('cp1252', errors='replace').strip()
-
-                                    versions.append(BinaryVersion(
-                                        name=name_clean,
-                                        parent_id=val,
-                                        is_root=False,
-                                        description=desc,
-                                        blob_offset=blob_offset,
-                                        blob_size=blob_size,
-                                    ))
-                                    pos += 8 + name_len
-                                    continue
-                        except (UnicodeDecodeError, ValueError):
-                            pass
-
-                pos += 1
 
         # Find EPK/verification info for each binary version
         for v in versions:
@@ -957,7 +883,16 @@ class OLSReader:
         first_map = pos + 5
 
         if compressed:
-            return None
+            import zlib
+            # Compressed map list: remaining data after count is zlib-compressed
+            try:
+                raw = zlib.decompress(self.data[first_map:])
+                # Replace data temporarily for sequential reading
+                self._compressed_backup = self.data
+                self.data = self.data[:first_map] + raw
+                return (first_map, count)
+            except zlib.error:
+                return None
 
         if count == 0 or count > 0x100000:
             return None
@@ -1188,6 +1123,8 @@ class OLSReader:
             self._seq_read_f64()
         if self._has_feature(596):
             self._seq_read_u32()
+        if self._has_feature(822):
+            self._seq_read_u32()
 
         # Derive parameter type
         type_map = {1: "VALUE", 2: "VALUE", 3: "CURVE", 4: "MAP", 5: "MAP"}
@@ -1225,10 +1162,6 @@ class OLSReader:
             if x_axis:
                 x_axis.points = cols
 
-        # OLS data_offset points 2 entries before actual cell data
-        type_size = {2: 1, 10: 2, 16: 4}.get(data_size, 2)
-        adjusted_offset = data_offset + 2 * type_size if data_offset > 0 else 0
-
         return Parameter(
             name=name,
             description=description,
@@ -1236,7 +1169,7 @@ class OLSReader:
             data_type=data_type,
             cols=cols,
             rows=rows,
-            data_offset=adjusted_offset,
+            data_offset=data_offset,
             x_axis=x_axis,
             y_axis=y_axis,
             unit=unit_str,
@@ -1268,9 +1201,17 @@ class OLSReader:
         for _ in range(map_count):
             try:
                 p = self._seq_read_one_map()
+                # Skip Hexdump entries — not real parameters
+                if p.description == "Hexdump" and not p.name:
+                    continue
                 parameters.append(p)
             except (EOFError, ValueError, struct.error):
                 break
+
+        # Restore original data if we decompressed
+        if hasattr(self, '_compressed_backup'):
+            self.data = self._compressed_backup
+            del self._compressed_backup
 
         return parameters
 
