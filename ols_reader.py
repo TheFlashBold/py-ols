@@ -931,19 +931,36 @@ class OLSReader:
     # -------------------------------------------------------------------
 
     def _seq_read_axis_data(self) -> AxisInfo:
-        """Read a single axis data block."""
+        """Read a single axis data block.
+
+        Layout per COlsAxisData_ReadFromFile (Ghidra: 0x003d1684):
+            multi_lang_string  description
+            string             axis_id (unit)
+            double             factor
+            double             offset
+            u32 (type_code)    axis+0x64
+            u32                axis+0x70  — axis data address (where breakpoints live)
+            u32                axis+0x74  — type_kind: 1=UBYTE, 3=UWORD, 5=ULONG, 7=FLOAT32
+                                            (same encoding as param data_type;
+                                             read via COlsMap_ReadField98)
+            u32                axis+0x78  — byte width (1/2/4) — derivable from type_kind
+            u32                axis+0x7c  — data_format (validated 2/10/16, always 0xa
+                                             empirically; not the real type)
+            bool, bool, ...    feature-gated
+
+        NOTE: the breakpoint COUNT is not in this block — it comes from the
+        param header (cols for X, rows for Y); _seq_read_one_map fills it in.
+        """
         description = self._seq_read_multi_lang_string()
         axis_id = self._seq_read_string()
         factor = self._seq_read_f64()
         offset = self._seq_read_f64()
         type_code = self._seq_read_u32()
-        self._seq_read_u32()
-        self._seq_read_u32()
-        self._seq_read_u32()
-        data_format = self._seq_read_u32()
-        if data_format not in (2, 10, 16):
-            data_format = 10
-        data_type = {2: "UBYTE", 10: "UWORD", 16: "ULONG"}.get(data_format, "UWORD")
+        axis_address = self._seq_read_u32()
+        type_kind = self._seq_read_u32()  # 1/3/5/7 → byte/word/long/float
+        self._seq_read_u32()  # byte width — redundant
+        self._seq_read_u32()  # data_format — always 0xa, ignored
+        data_type = {1: "UBYTE", 3: "UWORD", 5: "ULONG", 7: "FLOAT32"}.get(type_kind, "UWORD")
         self._seq_read_bool()
         self._seq_read_bool()
         if self._has_feature(264):
@@ -978,6 +995,7 @@ class OLSReader:
             self._seq_read_u32()
         return AxisInfo(
             points=0,
+            address=axis_address,
             unit="",
             factor=factor,
             offset=offset,
@@ -1006,11 +1024,12 @@ class OLSReader:
         description = self._seq_read_multi_lang_string()
         type_code = self._seq_read_u32()
         self._seq_read_u32()
-        self._seq_read_u32()
-        self._seq_read_u32()
-        raw_ds = self._seq_read_u32()
-        data_size = raw_ds if raw_ds in (2, 10, 16) else 10
-        data_type = {2: "UBYTE", 10: "UWORD", 16: "ULONG"}.get(data_size, "UWORD")
+        # 3rd u32 in this block is the value-type code: 1=byte, 3=word, 5=long, 7=float32.
+        # OLS does not record signedness — consumers overlay that from sister A2L if needed.
+        type_kind = self._seq_read_u32()
+        self._seq_read_u32()  # byte width (1/2/4) — redundant, derivable from type_kind
+        self._seq_read_u32()  # legacy field, observed always 0x0a in v303/v357/v479
+        data_type = {1: "UBYTE", 3: "UWORD", 5: "ULONG", 7: "FLOAT32"}.get(type_kind, "UWORD")
 
         name = ""
         folder_id = 0
@@ -1145,20 +1164,20 @@ class OLSReader:
         if rows > 0x4000:
             rows = 1
 
-        # Assign axes
+        # Assign axes. Each axis carries its own address (axis+0x70) read from
+        # the OLS. The point count comes from the param header (cols for X,
+        # rows for Y) — the axis block itself doesn't store it.
         x_axis = None
         y_axis = None
         if param_type == "CURVE":
             x_axis = axis1
             if x_axis:
                 x_axis.points = cols
-                x_axis.address = axis_offset
         elif param_type == "MAP":
             y_axis = axis1
             x_axis = axis2
             if y_axis:
                 y_axis.points = rows
-                y_axis.address = axis_offset
             if x_axis:
                 x_axis.points = cols
 
@@ -1346,20 +1365,25 @@ class OLSReader:
         """
         Extract binary blob data for a given binary version.
 
-        Args:
-            version: BinaryVersion with blob_offset and blob_size
-
-        Returns:
-            Raw binary data bytes
+        WinOLS prefixes every binary blob with a 4-byte checksum/marker
+        (typically 0x98728833 = `33 88 72 98` little-endian, but other values
+        appear in older or non-checksummed files). On read, WinOLS consumes
+        this u32 via COlsFile_VerifyChecksum (Ghidra: 0x0064fa64) before any
+        blob bytes are exposed. The OLS-stored data_offset for each parameter
+        is therefore relative to the post-marker data, so we strip the marker
+        here so consumers can use data_offset directly.
         """
         if version.blob_offset == 0 or version.blob_size == 0:
             return b""
 
-        if version.blob_offset + version.blob_size > len(self.data):
-            # Truncate to available data
-            return self.data[version.blob_offset:]
+        # 4-byte WinOLS checksum/marker at the front of every blob
+        MARKER_LEN = 4
 
-        return self.data[version.blob_offset:version.blob_offset + version.blob_size]
+        start = version.blob_offset + MARKER_LEN
+        end = min(version.blob_offset + version.blob_size, len(self.data))
+        if start >= end:
+            return b""
+        return self.data[start:end]
 
 
 def read_ols(filepath: str | Path) -> OLSFile:
